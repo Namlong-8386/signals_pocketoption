@@ -230,6 +230,7 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_id = update.effective_user.id
 
         active_signals[user_id] = {
+            "user_id": user_id,
             "asset": asset,
             "timeframe": tf_key,
             "timeframe_seconds": timeframe_seconds,
@@ -258,9 +259,13 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-        # Schedule result update
+        # Schedule result update. Pass a snapshot of the signal data so the
+        # update task is independent from any future signals the user requests.
         asyncio.create_task(
-            _update_result_after_delay(context.application, user_id, timeframe_seconds)
+            _update_result_after_delay(
+                context.application,
+                dict(active_signals[user_id]),
+            )
         )
 
         return SIGNAL_SENT
@@ -271,13 +276,17 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
 
-async def _update_result_after_delay(application: Application, user_id: int, delay: int) -> None:
-    """Wait for the timeframe to elapse, then update the user with the result."""
-    await asyncio.sleep(delay)
+async def _update_result_after_delay(application: Application, signal_data: Dict[str, Any]) -> None:
+    """Wait for the timeframe to elapse, then update the user with the result.
 
-    signal_data = active_signals.pop(user_id, None)
-    if not signal_data:
-        return
+    signal_data is a snapshot of the signal that was just sent; it is owned by
+    this task and will not be affected by later signals from the same user.
+    """
+    await asyncio.sleep(signal_data["timeframe_seconds"])
+
+    user_id = signal_data.get("user_id")
+    if user_id:
+        active_signals.pop(user_id, None)
 
     asset = signal_data["asset"]
     tf_key = signal_data["timeframe"]
