@@ -4,8 +4,11 @@ import os
 
 # ⚠️ Cảnh báo: lưu token/SSID trực tiếp trong code có rủi ro bảo mật.
 # Nên dùng Replit Secrets (TELEGRAM_BOT_TOKEN / POCKETOPTION_SSID) khi triển khai lâu dài.
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-POCKETOPTION_SSID = os.getenv("POCKETOPTION_SSID", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8614741199:AAG3CTDlsbNKEhsSWK4GXmBed1IGy8LUbB4")
+POCKETOPTION_SSID = os.getenv(
+    "POCKETOPTION_SSID",
+    '''[ "auth", { "session": "a:4:{s:10:\"session_id\";s:32:\"459c46f6ca7a7bbe21999bf1ebd90567\";s:10:\"ip_address\";s:14:\"194.233.82.226\";s:10:\"user_agent\";s:111:\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36\";s:13:\"last_activity\";i:1784980480;}3570955395f21b7eb7425e4876ae52d5", "isDemo": 0, "uid": 93969941, "platform": 2, "isFastHistory": true, "isOptimized": true } ]''',
+)
 POCKETOPTION_DEMO = os.getenv("POCKETOPTION_DEMO", "0").lower() in ("1", "true", "yes")
 POCKETOPTION_UID = int(os.getenv("POCKETOPTION_UID", "93969941") or "93969941")
 POCKETOPTION_PLATFORM = int(os.getenv("POCKETOPTION_PLATFORM", "2") or "2")
