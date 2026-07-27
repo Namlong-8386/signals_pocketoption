@@ -9,6 +9,8 @@ from loguru import logger
 from pocketoptionapi_async.client import AsyncPocketOptionClient
 from pocketoptionapi_async.models import Candle
 
+from pocketoptionapi_async.constants import ASSETS as LIBRARY_ASSETS
+
 from telegram_bot.config import (
     POCKETOPTION_SSID,
     POCKETOPTION_DEMO,
@@ -97,8 +99,9 @@ class BotPocketClient:
                 auto_reconnect=True,
                 enable_logging=True,
             )
-            # Attach directly to the websocket client so we receive the raw payout message
+            # Attach directly to the websocket client so we receive asset data
             self._client._websocket.add_event_handler("payout_update", self._on_payout_update)
+            self._client._websocket.add_event_handler("binary_updateAssets", self._on_assets_update)
             self._client.add_event_callback("disconnected", self._on_disconnected)
 
             try:
@@ -113,8 +116,17 @@ class BotPocketClient:
                 raise RuntimeError("Không thể kết nối đến PocketOption. Kiểm tra lại SSID.")
 
             self._connected = True
-            # Wait briefly for payout/asset list to arrive
-            await asyncio.sleep(2.5)
+            # Wait briefly for asset list to arrive
+            await asyncio.sleep(3.0)
+            # If no assets arrived from the server, seed from library's hardcoded list
+            if not self._assets:
+                logger.warning("No asset list received from server — using built-in fallback list")
+                self._assets = {
+                    sym: {"is_otc": "_otc" in sym, "tradable": True, "id": asset_id}
+                    for sym, asset_id in LIBRARY_ASSETS.items()
+                }
+                self._assets_last_update = datetime.now().timestamp()
+                logger.info(f"Fallback asset list loaded: {len(self._assets)} assets")
             logger.info("Connected to PocketOption.")
             return True
 
@@ -122,13 +134,68 @@ class BotPocketClient:
         if not self._connected or not self._client or not self._client.is_connected:
             await self.connect()
 
-    def _on_payout_update(self, data: Dict[str, Any]) -> None:
-        assets = data.get("assets", {})
-        logger.info(f"BotPocketClient received payout_update with {len(assets)} assets")
-        if assets:
-            self._assets = assets
+    def _on_assets_update(self, data: Any) -> None:
+        """Handle binary_updateAssets event.
+        Server format: list of lists — [id, symbol, name, type, ?, payout, ...]
+        Example: [5, '#AAPL', 'Apple', 'stock', 2, 50, 60, 30, 3, 0, 170, 0, [], timestamp, is_open, [timeframes]]
+        """
+        if not isinstance(data, list):
+            return
+        count = 0
+        for item in data:
+            if isinstance(item, list) and len(item) >= 4:
+                # list format: [id, symbol, name, type, ?, payout, ...]
+                symbol = str(item[1]) if len(item) > 1 else None
+                if not symbol:
+                    continue
+                payout = item[5] if len(item) > 5 else 0
+                is_otc = "_otc" in symbol
+                # field index 14 (if present) indicates if asset is open/tradable
+                tradable = bool(item[14]) if len(item) > 14 else (payout > 0)
+                self._assets[symbol] = {
+                    "id": item[0],
+                    "name": str(item[2]) if len(item) > 2 else symbol,
+                    "type": str(item[3]) if len(item) > 3 else "",
+                    "payout": payout,
+                    "is_otc": is_otc,
+                    "tradable": tradable,
+                }
+                count += 1
+            elif isinstance(item, dict):
+                symbol = item.get("symbol")
+                if symbol:
+                    self._assets[symbol] = {
+                        "is_otc": "_otc" in symbol,
+                        "tradable": item.get("tradable", True),
+                        **item,
+                    }
+                    count += 1
+        if count:
             self._assets_last_update = datetime.now().timestamp()
-            logger.info(f"Asset list updated: {len(self._assets)} assets")
+            logger.info(f"Assets from updateAssets: {count} total")
+
+    def _on_payout_update(self, data: Dict[str, Any]) -> None:
+        # New library emits one event per asset: {id, symbol, name, type, payout}
+        symbol = data.get("symbol")
+        if symbol:
+            is_otc = symbol.endswith("_otc")
+            self._assets[symbol] = {
+                "id": data.get("id"),
+                "name": data.get("name"),
+                "type": data.get("type"),
+                "payout": data.get("payout"),
+                "is_otc": is_otc,
+                "tradable": True,
+            }
+            self._assets_last_update = datetime.now().timestamp()
+            logger.debug(f"Asset added: {symbol} (otc={is_otc})")
+        else:
+            # Fallback: old format with assets dict
+            assets = data.get("assets", {})
+            if assets:
+                self._assets = assets
+                self._assets_last_update = datetime.now().timestamp()
+        logger.info(f"Asset list updated: {len(self._assets)} assets")
 
     def _on_disconnected(self, _data: Any) -> None:
         self._connected = False
