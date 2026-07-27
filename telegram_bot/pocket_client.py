@@ -73,6 +73,7 @@ class BotPocketClient:
         self._assets_last_update: Optional[float] = None
         self._connected = False
         self._connection_lock = asyncio.Lock()
+        self._latest_prices: Dict[str, float] = {}
 
     @staticmethod
     def _format_ssid(raw: str) -> str:
@@ -146,6 +147,7 @@ class BotPocketClient:
             self._client._websocket.add_event_handler("payout_update", self._on_payout_update)
             self._client._websocket.add_event_handler("binary_updateAssets", self._on_assets_update)
             self._client.add_event_callback("disconnected", self._on_disconnected)
+            self._client.add_event_callback("stream_update", self._on_stream_update)
 
             try:
                 connected = await asyncio.wait_for(self._client.connect(), timeout=timeout)
@@ -242,7 +244,35 @@ class BotPocketClient:
 
     def _on_disconnected(self, _data: Any) -> None:
         self._connected = False
+        self._latest_prices.clear()
         logger.warning("Disconnected from PocketOption")
+
+    def _on_stream_update(self, data: Any) -> None:
+        """Capture live tick prices from the stream so the bot can use the
+        current market price as the entry/exit price instead of stale candle
+        closes."""
+        try:
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, (list, tuple)) and len(item) >= 3:
+                        symbol = str(item[0])
+                        price = float(item[-1])
+                        self._latest_prices[symbol] = price
+            elif isinstance(data, dict):
+                raw = data.get("data") or data.get("candles")
+                if isinstance(raw, list):
+                    for candle in raw:
+                        if isinstance(candle, dict):
+                            symbol = candle.get("asset")
+                            price = candle.get("close")
+                            if symbol is not None and price is not None:
+                                self._latest_prices[str(symbol)] = float(price)
+        except Exception as e:
+            logger.debug(f"Stream update parse error: {e}")
+
+    def get_current_price(self, asset: str) -> Optional[float]:
+        """Return the latest live tick price for an asset, if available."""
+        return self._latest_prices.get(asset)
 
     async def get_assets(self, max_wait: float = 10.0) -> Dict[str, Dict[str, Any]]:
         await self.ensure_connected()
