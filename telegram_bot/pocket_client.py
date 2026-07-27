@@ -11,6 +11,49 @@ from pocketoptionapi_async.models import Candle
 
 from pocketoptionapi_async.constants import ASSETS as LIBRARY_ASSETS
 
+# Hardcoded categorization for the fallback asset list; the server also sends
+# asset types for live assets, but the built-in list only contains symbols.
+_CRYPTO_SYMBOLS = {
+    "BTCUSD", "BTCJPY", "BTCGBP", "ETHUSD", "BCHUSD", "BCHEUR", "BCHGBP",
+    "BCHJPY", "DASH_USD", "DOTUSD", "LNKUSD",
+}
+_INDEX_SYMBOLS = {
+    "100GBP", "AEX25", "AUS200", "CAC40", "D30EUR", "DJI30", "E35EUR",
+    "E50EUR", "F40EUR", "H33HKD", "JPN225", "NASUSD", "SMI20", "SP500",
+}
+_COMMODITY_SYMBOLS = {
+    "XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD", "XNGUSD", "UKBRENT", "USCRUDE",
+}
+
+_CATEGORY_LABELS = {
+    "forex": "💱 Forex",
+    "crypto": "₿ Crypto",
+    "stock": "📈 Cổ phiếu",
+    "commodity": "🛢 Hàng hóa",
+    "index": "📊 Chỉ số",
+    "otc": "🌙 OTC",
+}
+
+
+def get_asset_category(symbol: str) -> str:
+    """Categorize an asset symbol into a market group."""
+    s = symbol.upper().replace("_", "")
+    if "OTC" in s:
+        return "otc"
+    if symbol.startswith("#"):
+        return "stock"
+    if s in _COMMODITY_SYMBOLS or s.startswith(("XAU", "XAG", "XPT", "XPD", "XNG")):
+        return "commodity"
+    if s in _CRYPTO_SYMBOLS or any(c in s for c in ("BTC", "ETH", "BCH", "DASH", "DOT", "LNK")):
+        return "crypto"
+    if s in _INDEX_SYMBOLS or any(ch.isdigit() for ch in symbol):
+        return "index"
+    return "forex"
+
+
+def get_category_label(category: str) -> str:
+    return _CATEGORY_LABELS.get(category, category.upper())
+
 from telegram_bot.config import (
     POCKETOPTION_SSID,
     POCKETOPTION_DEMO,
@@ -228,6 +271,23 @@ class BotPocketClient:
 
     def list_all_active_assets(self) -> List[str]:
         return sorted([sym for sym, info in self._assets.items() if info.get("tradable")])
+
+    def list_categories(self) -> List[str]:
+        """Return non-empty asset categories in a fixed display order."""
+        order = ["forex", "crypto", "stock", "commodity", "index", "otc"]
+        found = {
+            get_asset_category(sym)
+            for sym, info in self._assets.items()
+            if info.get("tradable")
+        }
+        return [c for c in order if c in found]
+
+    def list_assets_by_category(self, category: str) -> List[str]:
+        """Return sorted tradable assets for a given category."""
+        return sorted(
+            [sym for sym, info in self._assets.items()
+             if get_asset_category(sym) == category and info.get("tradable")]
+        )
 
     async def get_candles(self, asset: str, timeframe: int, count: int = ANALYSIS_CANDLE_COUNT) -> List[Candle]:
         await self.ensure_connected()

@@ -15,7 +15,7 @@ from telegram.ext import (
 from loguru import logger
 
 from telegram_bot.config import TELEGRAM_BOT_TOKEN, TIMEFRAMES
-from telegram_bot.pocket_client import BotPocketClient
+from telegram_bot.pocket_client import BotPocketClient, get_category_label
 from telegram_bot.analyzer import analyze_candles, evaluate_signal, SignalResult
 
 # Conversation states
@@ -29,17 +29,37 @@ pocket_client = BotPocketClient()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point: show market selection."""
+    """Entry point: show market category selection."""
     logger.info(f"Received /start from user {update.effective_user.id if update.effective_user else 'unknown'}")
+
+    # Clear navigation state so returning to the menu starts fresh
+    context.user_data.pop("category", None)
+    context.user_data.pop("page", None)
+
     text = (
         "🤖 *PocketOption Signal Bot*\n\n"
-        "Chọn thị trường bạn muốn giao dịch.\n"
+        "Chọn nhóm thị trường bạn muốn giao dịch.\n"
         "Các cặp tiền sẽ được lấy trực tiếp từ API PocketOption."
     )
-    keyboard = [
-        [InlineKeyboardButton("💱 REAL (thị trường mở cửa)", callback_data="market_real")],
-        [InlineKeyboardButton("🌙 OTC (ngoài giờ)", callback_data="market_otc")],
-    ]
+
+    try:
+        await pocket_client.ensure_connected()
+        await pocket_client.get_assets()
+        categories = pocket_client.list_categories()
+    except Exception as e:
+        logger.warning(f"Could not load categories for menu: {e}")
+        categories = []
+
+    if not categories:
+        # Fallback to the two classic categories if API is unavailable
+        categories = ["real", "otc"]
+        labels = {"real": "💱 REAL", "otc": "🌙 OTC"}
+        keyboard = [[InlineKeyboardButton(labels.get(c, c.upper()), callback_data=f"cat_{c}")] for c in categories]
+    else:
+        # Build buttons in a 2-column grid
+        buttons = [InlineKeyboardButton(get_category_label(c), callback_data=f"cat_{c}") for c in categories]
+        keyboard = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if update.message:
@@ -49,11 +69,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return CHOOSING_MARKET
 
 
+ASSETS_PER_PAGE = 15  # 3 columns × 5 rows
+
+
 async def _show_asset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Show the list of active assets for the selected market."""
+    """Show the paginated list of active assets for the selected category."""
     query = update.callback_query
-    market = context.user_data.get("market")
-    if not market:
+    category = context.user_data.get("category")
+    page = context.user_data.get("page", 0)
+    if not category:
         return await start(update, context)
 
     await query.edit_message_text("⏳ Đang kết nối và lấy danh sách cặp tiền từ API...")
@@ -61,33 +85,54 @@ async def _show_asset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         await pocket_client.ensure_connected()
         await pocket_client.get_assets()
-        if market == "otc":
-            symbols = pocket_client.list_otc_assets()
-            title = "🌙 *Cặp tiền OTC*"
+
+        if category in ("real", "otc"):
+            # Backward-compatible legacy market filter
+            symbols = pocket_client.list_otc_assets() if category == "otc" else pocket_client.list_real_assets()
+            title = "🌙 *Cặp tiền OTC*" if category == "otc" else "💱 *Cặp tiền REAL*"
         else:
-            symbols = pocket_client.list_real_assets()
-            title = "💱 *Cặp tiền REAL*"
+            symbols = pocket_client.list_assets_by_category(category)
+            title = f"{get_category_label(category)} *Cặp tiền*"
 
         if not symbols:
             await query.edit_message_text(
-                f"Không tìm thấy cặp tiền {market.upper()} nào đang hoạt động. "
-                "Thử lại sau hoặc chọn thị trường khác.",
+                "Không tìm thấy cặp tiền nào đang hoạt động trong nhóm này. "
+                "Thử lại sau hoặc chọn nhóm khác.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔙 Quay lại", callback_data="back_market")]
                 ]),
             )
             return CHOOSING_ASSET
 
+        total_pages = max(1, (len(symbols) + ASSETS_PER_PAGE - 1) // ASSETS_PER_PAGE)
+        page = max(0, min(page, total_pages - 1))
+        context.user_data["page"] = page
+
+        start_idx = page * ASSETS_PER_PAGE
+        end_idx = start_idx + ASSETS_PER_PAGE
+        page_symbols = symbols[start_idx:end_idx]
+
         buttons = [
             InlineKeyboardButton(sym, callback_data=f"asset_{sym}")
-            for sym in symbols[:100]
+            for sym in page_symbols
         ]
         rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+
+        # Pagination controls
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Trang trước", callback_data=f"page_{category}_{page - 1}"))
+        nav_buttons.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="page_info"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton("Trang sau ➡️", callback_data=f"page_{category}_{page + 1}"))
+        if nav_buttons:
+            rows.append(nav_buttons)
+
         rows.append([InlineKeyboardButton("🔙 Quay lại", callback_data="back_market")])
 
         await query.edit_message_text(
             f"{title}\n\n"
-            f"Tìm thấy *{len(symbols)}* cặp đang hoạt động.\n"
+            f"Tìm thấy *{len(symbols)}* cặp. Trang *{page + 1}/{total_pages}*.\n"
             f"Chọn một cặp để phân tích:",
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode="Markdown",
@@ -105,13 +150,28 @@ async def _show_asset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return CHOOSING_ASSET
 
 
-async def market_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle market selection and show asset list."""
+async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle category selection and show the first page of assets."""
     query = update.callback_query
     await query.answer()
 
-    market = query.data.split("_")[-1]  # real or otc
-    context.user_data["market"] = market
+    category = query.data.split("_", 1)[-1]
+    context.user_data["category"] = category
+    context.user_data["page"] = 0
+    return await _show_asset_list(update, context)
+
+
+async def page_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle pagination navigation."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "page_info":
+        return CHOOSING_ASSET
+
+    _, category, page_str = query.data.split("_", 2)
+    context.user_data["category"] = category
+    context.user_data["page"] = int(page_str)
     return await _show_asset_list(update, context)
 
 
@@ -122,6 +182,9 @@ async def asset_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if query.data == "back_market":
         return await start(update, context)
+
+    if query.data == "back_asset":
+        return await _show_asset_list(update, context)
 
     asset = query.data.split("_", 1)[-1]
     context.user_data["asset"] = asset
@@ -282,10 +345,12 @@ def build_application() -> Application:
         entry_points=[CommandHandler("start", start)],
         states={
             CHOOSING_MARKET: [
-                CallbackQueryHandler(market_selected, pattern=r"^market_(real|otc)$"),
+                CallbackQueryHandler(category_selected, pattern=r"^cat_"),
             ],
             CHOOSING_ASSET: [
                 CallbackQueryHandler(asset_selected, pattern=r"^(asset_|back_market)"),
+                CallbackQueryHandler(page_selected, pattern=r"^page_"),
+                CallbackQueryHandler(category_selected, pattern=r"^cat_"),
             ],
             CHOOSING_TIMEFRAME: [
                 CallbackQueryHandler(timeframe_selected, pattern=r"^(tf_|back_asset)"),

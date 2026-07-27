@@ -4,11 +4,12 @@ A Telegram bot that connects to PocketOption and sends trading signals using tec
 
 ## How to run
 
-```
-python main.py
-```
+The workflow **"Start application"** is configured to run `python main.py`.
 
-The workflow "Start application" is configured to run `python main.py`.
+To start or restart the bot:
+
+1. Open the workflow panel.
+2. Run **"Start application"** (or use `python main.py` in the shell).
 
 ## Project structure
 
