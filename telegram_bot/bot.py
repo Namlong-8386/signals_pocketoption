@@ -227,9 +227,9 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         signal = analyze_candles(candles)
 
         # Use the live tick price as the entry price so consecutive signals
-        # do not share the same stale candle close. Fall back to the candle
-        # close if the stream price is not yet available.
-        current_price = pocket_client.get_current_price(asset)
+        # do not share the same stale candle close. Wait briefly for the
+        # stream to deliver a tick after subscribing via changeSymbol.
+        current_price = await pocket_client.get_current_price_with_timeout(asset, timeout=2.0)
         if current_price is not None:
             signal.price = current_price
             logger.info(f"Using live price for {asset}: {current_price}")
@@ -308,7 +308,7 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
 
         # Prefer the live tick price for the exit; fall back to fetching the
         # latest candle close if the stream hasn't provided a price yet.
-        exit_price = pocket_client.get_current_price(asset)
+        exit_price = await pocket_client.get_current_price_with_timeout(asset, timeout=2.0)
         if exit_price is None:
             exit_price = await pocket_client.get_latest_price(asset, signal_data["timeframe_seconds"])
             logger.info(f"Result for {asset}: no live price, using candle close {exit_price}")

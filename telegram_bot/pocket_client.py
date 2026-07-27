@@ -274,6 +274,22 @@ class BotPocketClient:
         """Return the latest live tick price for an asset, if available."""
         return self._latest_prices.get(asset)
 
+    async def get_current_price_with_timeout(
+        self, asset: str, timeout: float = 2.0
+    ) -> Optional[float]:
+        """Return the latest live tick price, waiting up to `timeout` seconds
+        for the stream to deliver the first tick after subscribing to the asset.
+        """
+        if asset in self._latest_prices:
+            return self._latest_prices[asset]
+
+        deadline = datetime.now().timestamp() + timeout
+        while datetime.now().timestamp() < deadline:
+            if asset in self._latest_prices:
+                return self._latest_prices[asset]
+            await asyncio.sleep(0.1)
+        return None
+
     async def get_assets(self, max_wait: float = 10.0) -> Dict[str, Dict[str, Any]]:
         await self.ensure_connected()
         if self._assets_last_update:
