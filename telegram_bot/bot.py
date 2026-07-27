@@ -282,7 +282,9 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
     signal_data is a snapshot of the signal that was just sent; it is owned by
     this task and will not be affected by later signals from the same user.
     """
-    await asyncio.sleep(signal_data["timeframe_seconds"])
+    # Wait for the candle to close, then add a small buffer so the API has
+    # the new candle available before we request it.
+    await asyncio.sleep(signal_data["timeframe_seconds"] + 5)
 
     user_id = signal_data.get("user_id")
     if user_id:
@@ -295,11 +297,26 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
 
     try:
         await pocket_client.ensure_connected()
-        exit_price = await pocket_client.get_latest_price(asset, signal_data["timeframe_seconds"])
+
+        # Retry a few times if the exit price hasn't changed yet, in case the
+        # API returns stale data right after the candle closes.
+        exit_price = None
+        for attempt in range(3):
+            exit_price = await pocket_client.get_latest_price(asset, signal_data["timeframe_seconds"])
+            if exit_price != signal.price:
+                break
+            logger.warning(f"Result price for {asset} unchanged (attempt {attempt + 1}/3), retrying...")
+            await asyncio.sleep(3)
+
         result = evaluate_signal(signal, exit_price)
 
         won = result["won"]
-        outcome = "✅ WIN" if won else "❌ LOSS"
+        if result["diff"] == 0:
+            outcome = "🔄 HÒA"
+        elif won:
+            outcome = "✅ WIN"
+        else:
+            outcome = "❌ LOSS"
         direction_text = "CALL" if signal.direction == "CALL" else "PUT"
 
         text = (
