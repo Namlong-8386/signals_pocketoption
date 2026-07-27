@@ -273,8 +273,12 @@ class BotPocketClient:
         return sorted([sym for sym, info in self._assets.items() if info.get("tradable")])
 
     def list_categories(self) -> List[str]:
-        """Return non-empty asset categories in a fixed display order."""
-        order = ["forex", "crypto", "stock", "commodity", "index", "otc"]
+        """Return non-empty asset categories in a fixed display order.
+
+        The UI only exposes Forex and OTC; other categories are intentionally
+        hidden because the user requested a simpler menu.
+        """
+        order = ["forex", "otc"]
         found = {
             get_asset_category(sym)
             for sym, info in self._assets.items()
