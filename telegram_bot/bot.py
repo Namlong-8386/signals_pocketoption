@@ -197,14 +197,28 @@ async def _show_asset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         rows.append([InlineKeyboardButton("🔙 Quay lại", callback_data="back_market")])
 
-        await _show_photo_message(
-            query,
-            ASSET_IMAGE,
+        asset_caption = (
             f"{title}\n\n"
             f"Tìm thấy *{len(symbols)}* cặp. Trang *{page + 1}/{total_pages}*.\n"
-            f"Chọn một cặp để phân tích:",
-            InlineKeyboardMarkup(rows),
+            "Chọn một cặp để phân tích:"
         )
+        if context.user_data.pop("send_new_asset_menu", False):
+            # A new signal keeps the previous market category (OTC/Forex) but
+            # must be delivered as a fresh message, not an edit of the signal.
+            await context.bot.send_photo(
+                chat_id=query.message.chat_id,
+                photo=ASSET_IMAGE,
+                caption=asset_caption,
+                reply_markup=InlineKeyboardMarkup(rows),
+                parse_mode="Markdown",
+            )
+        else:
+            await _show_photo_message(
+                query,
+                ASSET_IMAGE,
+                asset_caption,
+                InlineKeyboardMarkup(rows),
+            )
         return CHOOSING_ASSET
 
     except Exception as e:
@@ -484,7 +498,7 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
 
 
 async def new_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Delete the old signal and send a fresh market-selection message."""
+    """Delete the old signal and reopen the same OTC/Forex asset list."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id if update.effective_user else None
@@ -493,8 +507,20 @@ async def new_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if task and not task.done():
             task.cancel()
         active_signals.pop(user_id, None)
-    context.user_data["send_new_menu"] = True
-    return await start(update, context)
+    category = context.user_data.get("category")
+    if not category:
+        # Older signal messages may not have category state; only those fall
+        # back to the market selector.
+        context.user_data["send_new_menu"] = True
+        return await start(update, context)
+
+    context.user_data["page"] = 0
+    context.user_data["send_new_asset_menu"] = True
+    try:
+        await query.message.delete()
+    except Exception as e:
+        logger.debug(f"Could not delete previous signal message: {e}")
+    return await _show_asset_list(update, context)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
