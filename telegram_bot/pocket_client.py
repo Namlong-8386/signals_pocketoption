@@ -216,6 +216,7 @@ class BotPocketClient:
         """
         if not isinstance(data, list):
             return
+        updated_assets: Dict[str, Dict[str, Any]] = {}
         count = 0
         for item in data:
             if isinstance(item, list) and len(item) >= 4:
@@ -227,7 +228,7 @@ class BotPocketClient:
                 is_otc = get_asset_category(symbol) == "otc"
                 # field index 14 (if present) indicates if asset is open/tradable
                 tradable = bool(item[14]) if len(item) > 14 else (payout > 0)
-                self._assets[symbol] = {
+                updated_assets[symbol] = {
                     "id": item[0],
                     "name": str(item[2]) if len(item) > 2 else symbol,
                     "type": str(item[3]) if len(item) > 3 else "",
@@ -239,36 +240,53 @@ class BotPocketClient:
             elif isinstance(item, dict):
                 symbol = item.get("symbol")
                 if symbol:
-                    self._assets[symbol] = {
-                        "is_otc": get_asset_category(str(symbol)) == "otc",
-                        "tradable": item.get("tradable", True),
-                        **item,
-                    }
+                    updated_assets[str(symbol)] = self._normalize_asset(
+                        str(symbol), item
+                    )
                     count += 1
         if count:
+            # updateAssets is a complete server snapshot. Replace the cache so
+            # pairs that just closed are not retained from an older snapshot.
+            self._assets = updated_assets
             self._assets_last_update = datetime.now().timestamp()
             logger.info(f"Assets from updateAssets: {count} total")
 
+    @staticmethod
+    def _normalize_asset(symbol: str, info: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize an asset record without losing the server's tradable flag."""
+        normalized = dict(info)
+        normalized["is_otc"] = get_asset_category(symbol) == "otc"
+        # Do not turn a missing status into a false negative for payout events
+        # from older library versions, but always honor an explicit value.
+        normalized["tradable"] = bool(info.get("tradable", True))
+        return normalized
+
     def _on_payout_update(self, data: Dict[str, Any]) -> None:
-        # New library emits one event per asset: {id, symbol, name, type, payout}
+        # The server may emit one event per asset or a complete {assets: {...}}
+        # snapshot. In both cases preserve the explicit tradable status.
         symbol = data.get("symbol")
         if symbol:
-            is_otc = get_asset_category(symbol) == "otc"
-            self._assets[symbol] = {
-                "id": data.get("id"),
-                "name": data.get("name"),
-                "type": data.get("type"),
-                "payout": data.get("payout"),
-                "is_otc": is_otc,
-                "tradable": True,
-            }
+            symbol = str(symbol)
+            self._assets[symbol] = self._normalize_asset(symbol, data)
             self._assets_last_update = datetime.now().timestamp()
-            logger.debug(f"Asset added: {symbol} (otc={is_otc})")
+            logger.debug(
+                f"Asset updated: {symbol} "
+                f"(tradable={self._assets[symbol]['tradable']})"
+            )
         else:
             # Fallback: old format with assets dict
             assets = data.get("assets", {})
             if assets:
-                self._assets = assets
+                if isinstance(assets, dict):
+                    self._assets = {
+                        str(asset_symbol): self._normalize_asset(
+                            str(asset_symbol),
+                            asset_info if isinstance(asset_info, dict) else {},
+                        )
+                        for asset_symbol, asset_info in assets.items()
+                    }
+                elif isinstance(assets, list):
+                    self._on_assets_update(assets)
                 self._assets_last_update = datetime.now().timestamp()
         logger.info(f"Asset list updated: {len(self._assets)} assets")
 
