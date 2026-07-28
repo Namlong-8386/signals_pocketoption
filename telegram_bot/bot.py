@@ -23,6 +23,7 @@ CHOOSING_MARKET, CHOOSING_ASSET, CHOOSING_TIMEFRAME, SIGNAL_SENT = range(4)
 
 # In-memory store for active signals keyed by user_id
 active_signals: Dict[int, Dict[str, Any]] = {}
+active_signal_tasks: Dict[int, asyncio.Task] = {}
 
 # Shared PocketOption client
 pocket_client = BotPocketClient()
@@ -120,7 +121,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             parse_mode="Markdown",
         )
     elif update.callback_query:
-        await _show_photo_message(update.callback_query, START_IMAGE, text, reply_markup)
+        query = update.callback_query
+        if context.user_data.pop("send_new_menu", False):
+            try:
+                await query.message.delete()
+            except Exception as e:
+                logger.debug(f"Could not delete previous signal message: {e}")
+            await context.bot.send_photo(
+                chat_id=query.message.chat_id,
+                photo=START_IMAGE,
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown",
+            )
+        else:
+            await _show_photo_message(query, START_IMAGE, text, reply_markup)
     return CHOOSING_MARKET
 
 
@@ -369,12 +384,13 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if signal.direction != "WAIT":
             # Schedule result update. Pass a snapshot of the signal data so the
             # update task is independent from any future signals the user requests.
-            asyncio.create_task(
+            task = asyncio.create_task(
                 _update_result_after_delay(
                     context.application,
                     dict(active_signals[user_id]),
                 )
             )
+            active_signal_tasks[user_id] = task
 
         return SIGNAL_SENT
 
@@ -398,6 +414,7 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
     user_id = signal_data.get("user_id")
     if user_id:
         active_signals.pop(user_id, None)
+        active_signal_tasks.pop(user_id, None)
 
     asset = signal_data["asset"]
     tf_key = signal_data["timeframe"]
@@ -467,9 +484,16 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
 
 
 async def new_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Restart from market selection."""
+    """Delete the old signal and send a fresh market-selection message."""
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id:
+        task = active_signal_tasks.pop(user_id, None)
+        if task and not task.done():
+            task.cancel()
+        active_signals.pop(user_id, None)
+    context.user_data["send_new_menu"] = True
     return await start(update, context)
 
 
