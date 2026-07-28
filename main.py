@@ -11,15 +11,14 @@ from telegram_bot.bot import build_application, pocket_client
 async def main() -> None:
     logger.info("Starting Telegram PocketOption Signal Bot...")
 
-    # Pre-connect to PocketOption so asset lists are ready when users arrive
-    try:
-        await pocket_client.connect()
-        logger.info("PocketOption pre-connected successfully")
-    except Exception as e:
-        logger.warning(f"Could not pre-connect to PocketOption: {e}")
-        logger.info("Bot will retry connection when users interact.")
-
     application = build_application()
+
+    async def connect_pocketoption():
+        try:
+            await pocket_client.connect()
+            logger.info("PocketOption background connection established")
+        except Exception as e:
+            logger.warning(f"PocketOption background connection failed: {e}")
 
     # Graceful shutdown helper
     async def shutdown():
@@ -34,8 +33,14 @@ async def main() -> None:
 
     await application.initialize()
     await application.start()
+    # Start Telegram polling first. Broker initialization must never delay
+    # command handling or make /start appear unresponsive.
+    polling_task = asyncio.create_task(
+        application.updater.start_polling(drop_pending_updates=True)
+    )
+    await asyncio.sleep(0.2)
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    await application.updater.start_polling(drop_pending_updates=True)
+    asyncio.create_task(connect_pocketoption())
 
     # Keep running until interrupted
     stop_event = asyncio.Event()

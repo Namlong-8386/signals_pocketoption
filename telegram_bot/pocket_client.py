@@ -291,7 +291,8 @@ class BotPocketClient:
                         symbol = str(item[0])
                         price = float(item[-1])
                         self._latest_prices[symbol] = price
-                        logger.debug(f"Live tick: {symbol} = {price}")
+                        # Do not log every tick: the broker can emit hundreds
+                        # of updates during startup and drown out bot errors.
         except Exception as e:
             logger.debug(f"JSON data parse error: {e}")
 

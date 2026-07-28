@@ -83,11 +83,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
 
     try:
-        await pocket_client.ensure_connected()
-        await pocket_client.get_assets()
+        # Never block /start on the broker connection. The menu remains
+        # usable while assets are refreshed in the background/next interaction.
+        await asyncio.wait_for(pocket_client.ensure_connected(), timeout=4.0)
+        await asyncio.wait_for(pocket_client.get_assets(max_wait=2.0), timeout=4.0)
         categories = pocket_client.list_categories()
     except Exception as e:
-        logger.warning(f"Could not load categories for menu: {e}")
+        logger.warning(f"Could not load categories for menu (using fallback): {e}")
         categories = []
 
     if not categories:
@@ -368,6 +370,10 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
     signal: SignalResult = signal_data["signal"]
     chat_id = signal_data["chat_id"]
 
+    if signal.direction == "WAIT":
+        logger.info(f"Skipping result update for WAIT signal: {asset}")
+        return
+
     try:
         await pocket_client.ensure_connected()
 
@@ -380,6 +386,10 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
         else:
             logger.info(f"Result for {asset}: using live price {exit_price}")
 
+        logger.info(
+            f"Evaluating {asset}: direction={signal.direction}, "
+            f"entry={signal.price}, exit={exit_price}"
+        )
         result = evaluate_signal(signal, exit_price)
 
         won = result["won"]
@@ -453,9 +463,14 @@ def build_application() -> Application:
                 CallbackQueryHandler(start, pattern=r"^back_market$"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+        ],
     )
 
     application.add_handler(conv_handler)
+    # Handle /start even if a user is not currently in the conversation.
+    application.add_handler(CommandHandler("start", start))
     application.add_error_handler(error_handler)
     return application
