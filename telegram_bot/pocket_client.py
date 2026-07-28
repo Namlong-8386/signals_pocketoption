@@ -533,6 +533,7 @@ class BotPocketClient:
         timeframe: int,
         entry_timestamp: float,
         tolerance: float = 3.0,
+        wait_timeout: float = 8.0,
     ) -> Optional[Candle]:
         """Return the candle closing at the signal expiry.
 
@@ -541,27 +542,33 @@ class BotPocketClient:
         broker identify the candle open, so choose the first candle whose open
         is at or after the expiry boundary and require it to be closed.
         """
-        candles = await self.get_candles(asset, timeframe, count=max(5, RESULT_CANDLE_COUNT))
-        if not candles:
-            return None
-
         expiry = float(entry_timestamp) + float(timeframe)
-        normalized = []
-        for candle in candles:
-            stamp = candle.timestamp.timestamp() if hasattr(candle.timestamp, "timestamp") else float(candle.timestamp)
-            normalized.append((stamp, candle))
-        normalized.sort(key=lambda item: item[0])
+        deadline = asyncio.get_running_loop().time() + wait_timeout
+        while True:
+            candles = await self.get_candles(
+                asset, timeframe, count=max(5, RESULT_CANDLE_COUNT)
+            )
+            normalized = []
+            for candle in candles:
+                stamp = self._candle_timestamp(candle)
+                normalized.append((stamp, candle))
+            normalized.sort(key=lambda item: item[0])
 
-        # Prefer the candle ending closest to the expiry boundary. Broker
-        # timestamps can be a few seconds off, hence the small tolerance.
-        candidates = [
-            (abs((stamp + timeframe) - expiry), candle)
-            for stamp, candle in normalized
-            if stamp + timeframe <= expiry + tolerance
-        ]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda item: item[0])[1]
+            # Never use a candle that ended before expiry. The previous logic
+            # did exactly that when the broker had not published the next
+            # candle yet, producing systematically false WIN/LOSS results.
+            candidates = [
+                (abs((stamp + timeframe) - expiry), candle)
+                for stamp, candle in normalized
+                if stamp + timeframe >= expiry - tolerance
+            ]
+            if candidates:
+                return min(candidates, key=lambda item: item[0])[1]
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(0.75, remaining))
 
     async def close(self) -> None:
         if self._client:
