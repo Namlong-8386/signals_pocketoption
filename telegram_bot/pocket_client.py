@@ -256,9 +256,10 @@ class BotPocketClient:
         """Normalize an asset record without losing the server's tradable flag."""
         normalized = dict(info)
         normalized["is_otc"] = get_asset_category(symbol) == "otc"
-        # Do not turn a missing status into a false negative for payout events
-        # from older library versions, but always honor an explicit value.
-        normalized["tradable"] = bool(info.get("tradable", True))
+        # A missing status is not proof that the market is open. In particular,
+        # payout events can contain only symbol/payout while the server still
+        # sends price ticks for a closed market.
+        normalized["tradable"] = info.get("tradable") is True
         return normalized
 
     def _on_payout_update(self, data: Dict[str, Any]) -> None:
@@ -267,7 +268,11 @@ class BotPocketClient:
         symbol = data.get("symbol")
         if symbol:
             symbol = str(symbol)
-            self._assets[symbol] = self._normalize_asset(symbol, data)
+            asset = self._normalize_asset(symbol, data)
+            if "tradable" not in data and symbol in self._assets:
+                # Partial payout updates must not erase a known status.
+                asset["tradable"] = self._assets[symbol].get("tradable") is True
+            self._assets[symbol] = asset
             self._assets_last_update = datetime.now().timestamp()
             logger.debug(
                 f"Asset updated: {symbol} "
@@ -289,6 +294,10 @@ class BotPocketClient:
                     self._on_assets_update(assets)
                 self._assets_last_update = datetime.now().timestamp()
         logger.info(f"Asset list updated: {len(self._assets)} assets")
+
+    def is_asset_tradable(self, asset: str) -> bool:
+        """Return True only when the latest asset snapshot explicitly says so."""
+        return self._assets.get(asset, {}).get("tradable") is True
 
     def _on_disconnected(self, _data: Any) -> None:
         self._connected = False

@@ -267,6 +267,14 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try:
         await pocket_client.ensure_connected()
+        await pocket_client.get_assets(max_wait=2.0)
+        if not pocket_client.is_asset_tradable(asset):
+            await _show_caption_message(
+                query,
+                f"⏸ *{asset}* hiện không mở giao dịch hoặc đã tạm dừng.\n\n"
+                "Vui lòng quay lại và chọn cặp đang hoạt động.",
+            )
+            return await _show_asset_list(update, context)
         candles = await pocket_client.get_candles(asset, timeframe_seconds)
         signal = analyze_candles(candles)
 
