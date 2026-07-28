@@ -2,6 +2,7 @@
 import asyncio
 import json
 import re
+from collections import defaultdict
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -11,6 +12,7 @@ from pocketoptionapi_async.client import AsyncPocketOptionClient
 from pocketoptionapi_async.models import Candle
 
 from pocketoptionapi_async.constants import ASSETS as LIBRARY_ASSETS
+from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 
 # Hardcoded categorization for the fallback asset list; the server also sends
 # asset types for live assets, but the built-in list only contains symbols.
@@ -42,6 +44,16 @@ _COMMON_FOREX_PAIRS = {
     "GBPAUD", "GBPCAD", "GBPCHF", "GBPJPY", "GBPNZD", "GBPUSD",
     "NZDCAD", "NZDJPY", "NZDUSD", "USDCAD", "USDCHF",
     "USDJPY", "USDMXN", "USDNOK", "USDPLN", "USDSEK", "USDTRY",
+}
+
+# The live PocketOption catalogue currently exposes this REAL set. Do not
+# invent extra REAL symbols from the library fallback: a symbol missing from
+# the broker catalogue will always fail candle requests.
+_ACTIVE_REAL_FOREX_PAIRS = {
+    "AUDCAD", "AUDCHF", "AUDJPY", "AUDUSD", "CADCHF", "CADJPY",
+    "CHFJPY", "EURAUD", "EURCAD", "EURCHF", "EURGBP", "EURJPY",
+    "EURUSD", "GBPAUD", "GBPCAD", "GBPCHF", "GBPJPY", "GBPUSD",
+    "USDCAD", "USDCHF", "USDJPY",
 }
 
 _STOCK_NAME_MARKERS = {
@@ -119,12 +131,15 @@ class BotPocketClient:
 
     def __init__(self) -> None:
         self._client: Optional[AsyncPocketOptionClient] = None
+        self._history_client: Optional[PocketOptionAsync] = None
         self._assets: Dict[str, Dict[str, Any]] = {}
         self._assets_last_update: Optional[float] = None
         self._connected = False
         self._connection_lock = asyncio.Lock()
         self._candle_request_lock = asyncio.Lock()
         self._latest_prices: Dict[str, float] = {}
+        self._history_request_index = 1
+        self._history_requests: Dict[int, Dict[str, Any]] = {}
 
     @staticmethod
     def _format_ssid(raw: str) -> str:
@@ -213,8 +228,36 @@ class BotPocketClient:
                 raise RuntimeError("Không thể kết nối đến PocketOption. Kiểm tra lại SSID.")
 
             self._connected = True
+            # The legacy client still provides the live tick callbacks used by
+            # the bot, while the maintained upstream client handles the
+            # current history/live-candle protocol.
+            try:
+                self._history_client = PocketOptionAsync(ssid)
+                await asyncio.wait_for(self._history_client.connect(), timeout=timeout)
+                await asyncio.wait_for(
+                    self._history_client.wait_for_assets(timeout=10.0),
+                    timeout=12.0,
+                )
+                active_assets = await self._history_client.active_assets()
+                self._assets = {
+                    item["symbol"]: {
+                        "is_otc": bool(item.get("is_otc")),
+                        "tradable": bool(item.get("is_active", True)),
+                        "payout": item.get("payout"),
+                        "asset_type": item.get("asset_type"),
+                        "id": item.get("id"),
+                    }
+                    for item in active_assets
+                    if isinstance(item, dict) and item.get("symbol")
+                }
+                self._assets_last_update = datetime.now().timestamp()
+                logger.info(f"Loaded {len(self._assets)} active assets from PocketOption")
+            except Exception as exc:
+                self._history_client = None
+                logger.warning(f"Could not load maintained asset catalog: {exc}")
             # Wait briefly for asset list to arrive
-            await asyncio.sleep(3.0)
+            if not self._assets:
+                await asyncio.sleep(3.0)
             # If no assets arrived from the server, seed from library's hardcoded list
             if not self._assets:
                 logger.warning("No asset list received from server — using built-in fallback list")
@@ -227,7 +270,7 @@ class BotPocketClient:
             # Keep the normal REAL currency universe available.  The server's
             # payout/updateAssets packet is not a complete market catalogue
             # and may mark an otherwise requestable pair as closed temporarily.
-            for symbol in _COMMON_FOREX_PAIRS:
+            for symbol in _ACTIVE_REAL_FOREX_PAIRS:
                 self._assets.setdefault(
                     symbol,
                     {"is_otc": False, "tradable": True, "id": LIBRARY_ASSETS.get(symbol)},
@@ -324,6 +367,140 @@ class BotPocketClient:
         except Exception as e:
             logger.debug(f"Stream update parse error: {e}")
 
+    @staticmethod
+    def _parse_history_rows(rows: Any, asset: str, timeframe: int) -> List[Candle]:
+        """Parse binary history rows returned by PocketOption."""
+        if not isinstance(rows, list):
+            return []
+        candles: List[Candle] = []
+        ticks: List[tuple[float, float]] = []
+        for row in rows:
+            try:
+                if isinstance(row, dict):
+                    timestamp = row.get("time", row.get("timestamp"))
+                    if timestamp is None:
+                        continue
+                    if all(row.get(key) is not None for key in ("open", "close", "high", "low")):
+                        candles.append(Candle(
+                            timestamp=datetime.fromtimestamp(float(timestamp)),
+                            open=float(row["open"]),
+                            high=float(row["high"]),
+                            low=float(row["low"]),
+                            close=float(row["close"]),
+                            volume=float(row.get("volume") or 0),
+                            asset=asset,
+                            timeframe=timeframe,
+                        ))
+                    elif row.get("price") is not None:
+                        ticks.append((float(timestamp), float(row["price"])))
+                elif isinstance(row, (list, tuple)) and len(row) >= 5:
+                    candles.append(Candle(
+                        timestamp=datetime.fromtimestamp(float(row[0])),
+                        open=float(row[1]),
+                        high=float(row[3]),
+                        low=float(row[4]),
+                        close=float(row[2]),
+                        volume=float(row[5]) if len(row) > 5 else 0,
+                        asset=asset,
+                        timeframe=timeframe,
+                    ))
+                elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                    ticks.append((float(row[0]), float(row[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+
+        if candles:
+            return sorted(candles, key=lambda candle: candle.timestamp)
+        if not ticks:
+            return []
+
+        buckets: Dict[int, List[float]] = defaultdict(list)
+        for timestamp, price in ticks:
+            # Some responses use milliseconds.
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            bucket = int(timestamp // timeframe) * timeframe
+            buckets[bucket].append(price)
+        for bucket, prices in sorted(buckets.items()):
+            candles.append(Candle(
+                timestamp=datetime.fromtimestamp(bucket),
+                open=prices[0],
+                high=max(prices),
+                low=min(prices),
+                close=prices[-1],
+                volume=0,
+                asset=asset,
+                timeframe=timeframe,
+            ))
+        return candles
+
+    def _resolve_history_response(self, response: Dict[str, Any]) -> None:
+        try:
+            index = int(response["index"])
+            request = self._history_requests.pop(index, None)
+            if request is None:
+                return
+            candles = self._parse_history_rows(
+                response.get("data", []),
+                request["asset"],
+                request["timeframe"],
+            )
+            future = request["future"]
+            if not future.done():
+                future.set_result(candles)
+            logger.info(
+                f"Resolved historical candles for {request['asset']}: {len(candles)}"
+            )
+        except Exception as exc:
+            logger.warning(f"Could not parse historical response: {exc}")
+
+    async def _request_history_candles(
+        self, asset: str, timeframe: int, count: int, end_time: datetime
+    ) -> List[Candle]:
+        """Request historical candles through the history endpoint.
+
+        The installed PocketOption client sends ``changeSymbol`` for its
+        candle method. On some broker regions that only changes the live
+        stream and never emits historical candles, so use the native history
+        event directly and let the client's existing ``candles_received``
+        handler resolve the pending request.
+        """
+        if self._client is None:
+            raise RuntimeError("Client chưa kết nối")
+
+        future = asyncio.get_running_loop().create_future()
+        index = self._history_request_index
+        self._history_request_index += 1
+        payload = {
+            "asset": str(asset),
+            "index": index,
+            "period": int(timeframe),
+            "time": int(end_time.timestamp()),
+            "offset": int(count),
+        }
+        # PocketOption routes small history windows through the fast endpoint.
+        # The regular endpoint can stay silent for short requests on some
+        # regions even though the same symbol is available.
+        event_name = "loadHistoryPeriodFast" if count <= 100 else "loadHistoryPeriod"
+        message = f'42["{event_name}",{json.dumps(payload)}]'
+        logger.info(
+            f"Requesting historical candles with {event_name} for {asset} "
+            f"(timeframe={timeframe}, count={count})"
+        )
+        try:
+            self._history_requests[index] = {
+                "future": future,
+                "asset": asset,
+                "timeframe": timeframe,
+            }
+            await self._client._websocket.send_message(message)
+            candles = await asyncio.wait_for(future, timeout=12.0)
+            if candles:
+                return candles[-count:]
+            return []
+        finally:
+            self._history_requests.pop(index, None)
+
     def _on_json_data(self, data: Any) -> None:
         """Capture live tick prices from binary JSON attachments.
 
@@ -331,6 +508,9 @@ class BotPocketClient:
         This is the primary source of real-time entry/exit prices.
         """
         try:
+            if isinstance(data, dict) and "index" in data and "data" in data:
+                self._resolve_history_response(data)
+                return
             if isinstance(data, list):
                 for item in data:
                     if isinstance(item, (list, tuple)) and len(item) >= 3:
@@ -389,7 +569,7 @@ class BotPocketClient:
         return sorted(
             [
                 sym for sym, info in self._assets.items()
-                if is_forex_pair(sym)
+                if is_forex_pair(sym) and sym in _ACTIVE_REAL_FOREX_PAIRS
             ]
         )
 
@@ -416,7 +596,8 @@ class BotPocketClient:
             [
                 sym for sym, info in self._assets.items()
                 if (
-                    is_forex_pair(sym) if category == "forex"
+                    is_forex_pair(sym) and sym in _ACTIVE_REAL_FOREX_PAIRS
+                    if category == "forex"
                     else get_asset_category(sym) == category and info.get("tradable")
                 )
             ]
@@ -424,65 +605,56 @@ class BotPocketClient:
 
     async def get_candles(self, asset: str, timeframe: int, count: int = ANALYSIS_CANDLE_COUNT) -> List[Candle]:
         await self.ensure_connected()
-        if self._client is None:
+        if self._history_client is None:
             raise RuntimeError("Client chưa kết nối")
-        # Bypass the ASSETS validation in the base client because the server
-        # exposes many symbols that are not present in the hardcoded list.
-        from datetime import datetime
         from pocketoptionapi_async.exceptions import PocketOptionError
 
-        if not self._client.is_connected:
+        if not self._history_client.is_connected():
             raise RuntimeError("Chưa kết nối đến PocketOption")
 
-        # The library keys pending requests by "{asset}_{timeframe}". Serialize
-        # requests so two users selecting the same pair cannot replace the
-        # other's Future inside the websocket client.
         async with self._candle_request_lock:
-            max_retries = 2
-            request_counts = [count, min(count, 60)]
-            for attempt in range(max_retries):
-                requested_count = request_counts[attempt]
-                try:
-                    logger.info(
-                        f"Requesting {requested_count} candles for {asset} "
-                        f"(timeframe={timeframe}, attempt={attempt + 1})"
-                    )
-                    # Use the library's public method when its asset catalogue
-                    # knows the symbol. Server-only symbols bypass validation
-                    # but still use the same underlying candle request.
-                    candle_call = (
-                        self._client.get_candles
-                        if asset in LIBRARY_ASSETS
-                        else self._client._request_candles
-                    )
-                    candles = await asyncio.wait_for(
-                        candle_call(
-                            asset, timeframe, requested_count, datetime.now()
-                        ),
-                        timeout=12.0,
-                    )
-                    if candles:
-                        cache_key = f"{asset}_{timeframe}"
-                        self._client._candles_cache[cache_key] = candles
-                        logger.info(f"Retrieved {len(candles)} candles for {asset}")
-                        return candles
-                    logger.warning(
-                        f"PocketOption returned no candles for {asset} "
-                        f"after requesting {requested_count}"
-                    )
-                except Exception as e:
-                    if "WebSocket is not connected" in str(e) and attempt < max_retries - 1:
-                        logger.warning(f"Connection lost during candle request for {asset}, retrying...")
-                        if self._client.auto_reconnect:
-                            reconnected = await self._client._attempt_reconnection()
-                            if reconnected:
-                                continue
-                    if attempt == max_retries - 1:
-                        logger.error(f"Failed to get candles for {asset}: {e}")
-                        raise PocketOptionError(f"Failed to get candles: {e}")
-            raise PocketOptionError(
-                f"PocketOption không trả dữ liệu nến cho {asset}. Vui lòng thử lại."
+            logger.info(
+                f"Requesting {count} live candles for {asset} "
+                f"(timeframe={timeframe})"
             )
+            hours = max(0.2, (count * timeframe) / 3600 + 0.1)
+            try:
+                stream = self._history_client.get_candles_live(
+                    asset, timeframe, hours=hours, max_rows=count
+                )
+                closed, forming = await asyncio.wait_for(anext(stream), timeout=20.0)
+                await stream.aclose()
+                rows = list(closed)
+                if forming:
+                    rows.append(forming)
+                candles = [
+                    Candle(
+                        timestamp=datetime.fromtimestamp(
+                            float(row.get("time", row.get("timestamp", 0)))
+                        ),
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=float(row.get("volume") or 0),
+                        asset=asset,
+                        timeframe=timeframe,
+                    )
+                    for row in rows
+                    if isinstance(row, dict)
+                    and all(row.get(key) is not None for key in ("open", "high", "low", "close"))
+                ]
+                candles = sorted(candles, key=lambda candle: candle.timestamp)[-count:]
+                if not candles:
+                    raise PocketOptionError(
+                        f"PocketOption không trả dữ liệu nến cho {asset}."
+                    )
+                self._latest_prices[asset] = candles[-1].close
+                logger.info(f"Retrieved {len(candles)} candles for {asset}")
+                return candles
+            except Exception as exc:
+                logger.error(f"Failed to get candles for {asset}: {exc}")
+                raise PocketOptionError(f"Failed to get candles: {exc}") from exc
 
     async def get_latest_price(self, asset: str, timeframe: int = 60) -> float:
         """Return the latest close price by fetching a few recent candles."""
@@ -492,6 +664,9 @@ class BotPocketClient:
         return float(candles[-1].close)
 
     async def close(self) -> None:
+        if self._history_client:
+            await self._history_client.disconnect()
+            self._history_client = None
         if self._client:
             await self._client.disconnect()
             self._client = None

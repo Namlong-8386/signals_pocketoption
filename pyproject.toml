@@ -5,6 +5,7 @@ description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
     "loguru>=0.7.3",
+    "BinaryOptionsToolsV2==0.2.13",
     "pocketoptionapi-async>=2.0.1",
     "python-telegram-bot>=22.8",
     "telegram>=0.0.1",

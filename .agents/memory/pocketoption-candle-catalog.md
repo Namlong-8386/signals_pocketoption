@@ -3,8 +3,8 @@ name: PocketOption candle and Forex catalog handling
 description: Reliable candle requests and complete Forex menu behavior for PocketOption.
 ---
 
-Use the PocketOption client's public candle method for symbols present in its catalogue; direct private candle requests are more fragile because response routing depends on websocket stream handlers. For server-only symbols, retain the raw request path as a compatibility fallback.
+Use `BinaryOptionsToolsV2`'s maintained `get_candles_live()` flow for PocketOption history/live candles. The older `pocketoptionapi_async` history endpoints can connect successfully but return no response even for valid active symbols.
 
-**Why:** The broker's payout/updateAssets snapshot is not a complete or stable market catalogue. It can omit otherwise requestable REAL pairs or mark them temporarily closed, and direct candle requests can return empty data even for valid pairs.
+**Why:** The broker's payout/updateAssets snapshot is not a complete or stable market catalogue, and the legacy history protocol is no longer reliable. The maintained client successfully returned OHLC data for both REAL and OTC symbols after normalizing the SSID.
 
-**How to apply:** Keep the Forex menu based on validated six-letter currency pairs and a curated common-pair universe, rather than filtering only by the current `tradable` flag. Keep OTC restricted to two valid currency codes.
+**How to apply:** Load active symbols from the maintained client's catalogue. Do not add invented REAL pairs from a hardcoded fallback; a symbol absent from the active catalogue should not appear in the menu. Keep OTC restricted to two valid currency codes, and convert live-candle rows into the project's `Candle` model.
