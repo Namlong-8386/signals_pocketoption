@@ -14,10 +14,11 @@ POCKETOPTION_PLATFORM = int(os.getenv("POCKETOPTION_PLATFORM", "2") or "2")
 
 # Available timeframes for the bot (in seconds)
 TIMEFRAMES = {
-    "1m": 60,
-    "3m": 180,
-    "5m": 300,
-    "15m": 900,
+    "s15": 15,
+    "s30": 30,
+    "m1": 60,
+    "m3": 180,
+    "m5": 300,
 }
 
 # Candles used for technical analysis

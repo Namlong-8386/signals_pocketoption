@@ -32,6 +32,14 @@ ASSET_IMAGE = "https://i.ibb.co/3m4mJbqW/uploaded-image.jpg"
 TIMEFRAME_IMAGE = "https://i.ibb.co/8gspvnSH/uploaded-image.jpg"
 CALL_IMAGE = "https://i.ibb.co/0RqnRvmn/uploaded-image.jpg"
 PUT_IMAGE = "https://i.ibb.co/hxNhCwc5/uploaded-image.jpg"
+WAIT_IMAGE = "https://i.ibb.co/B52N912P/uploaded-image.jpg"
+TIMEFRAME_LABELS = {
+    "s15": "S15",
+    "s30": "S30",
+    "m1": "M1",
+    "m3": "M3",
+    "m5": "M5",
+}
 
 
 async def _show_photo_message(
@@ -244,11 +252,16 @@ async def asset_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data["asset"] = asset
 
     keyboard = [
-        [InlineKeyboardButton("1 phút", callback_data="tf_1m")],
-        [InlineKeyboardButton("3 phút", callback_data="tf_3m")],
-        [InlineKeyboardButton("5 phút", callback_data="tf_5m")],
-        [InlineKeyboardButton("15 phút", callback_data="tf_15m")],
-        [InlineKeyboardButton("🔙 Quay lại", callback_data="back_asset")],
+        [
+            InlineKeyboardButton("S15", callback_data="tf_s15"),
+            InlineKeyboardButton("S30", callback_data="tf_s30"),
+        ],
+        [
+            InlineKeyboardButton("M1", callback_data="tf_m1"),
+            InlineKeyboardButton("M3", callback_data="tf_m3"),
+            InlineKeyboardButton("M5", callback_data="tf_m5"),
+        ],
+        [InlineKeyboardButton("Quay Lại", callback_data="back_asset")],
     ]
     await _show_photo_message(
         query,
@@ -269,9 +282,13 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     tf_key = query.data.split("_")[-1]
     timeframe_seconds = TIMEFRAMES[tf_key]
+    timeframe_label = TIMEFRAME_LABELS[tf_key]
     asset = context.user_data["asset"]
 
-    await _show_caption_message(query, f"⏳ Đang phân tích *{asset}* khung *{tf_key}*...")
+    await _show_caption_message(
+        query,
+        f"⏳ Đang phân tích *{asset}* khung *{timeframe_label}*...",
+    )
 
     try:
         await pocket_client.ensure_connected()
@@ -301,7 +318,7 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         active_signals[user_id] = {
             "user_id": user_id,
             "asset": asset,
-            "timeframe": tf_key,
+            "timeframe": timeframe_label,
             "timeframe_seconds": timeframe_seconds,
             "signal": signal,
             "entry_time": entry_time,
@@ -313,18 +330,16 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
             direction_emoji = "⏸ WAIT"
         else:
             direction_emoji = "🟢 CALL" if signal.direction == "CALL" else "🔴 PUT"
-        reasons_text = "\n".join(f"• {r}" for r in signal.reasons)
 
         text = (
             f"📊 *TÍN HIỆU {asset}*\n\n"
-            f"🕐 Khung thời gian: *{tf_key}*\n"
+            f"🕐 Khung thời gian: *{timeframe_label}*\n"
             f"💰 Giá tín hiệu: *{signal.price:.6f}*\n"
             f"📈 Hướng: *{direction_emoji}*\n"
             f"🎯 Độ tin cậy: *{int(signal.confidence * 100)}%*\n\n"
-            f"*Lý do:*\n{reasons_text}\n\n"
             +
             (
-                f"⏱ Kết quả sẽ được cập nhật sau *{tf_key}*."
+                f"⏱ Kết quả sẽ được cập nhật sau *{timeframe_label}*."
                 if signal.direction != "WAIT"
                 else "⏸ Chưa đủ điều kiện xác nhận — bot không khuyến nghị vào lệnh."
             )
@@ -338,7 +353,7 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         signal_image = (
             CALL_IMAGE if signal.direction == "CALL"
             else PUT_IMAGE if signal.direction == "PUT"
-            else TIMEFRAME_IMAGE
+            else WAIT_IMAGE
         )
         await _show_photo_message(
             query,
