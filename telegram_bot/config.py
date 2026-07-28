@@ -10,6 +10,7 @@ from config import (
     POCKETOPTION_DEMO,
     POCKETOPTION_UID,
     POCKETOPTION_PLATFORM,
+    GEMINI_API_KEY,
 )
 
 # Available timeframes for the bot (in seconds)

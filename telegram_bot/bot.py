@@ -17,6 +17,7 @@ from loguru import logger
 from telegram_bot.config import TELEGRAM_BOT_TOKEN, TIMEFRAMES
 from telegram_bot.pocket_client import BotPocketClient, get_category_label
 from telegram_bot.analyzer import analyze_candles, evaluate_signal, SignalResult
+from telegram_bot.gemini_signal import gemini_enhance_signal
 
 # Conversation states
 CHOOSING_MARKET, CHOOSING_ASSET, CHOOSING_TIMEFRAME, SIGNAL_SENT = range(4)
@@ -330,6 +331,13 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return await _show_asset_list(update, context)
         candles = await pocket_client.get_candles(asset, timeframe_seconds)
         signal = analyze_candles(candles)
+
+        # Gemini AI validation — enhances or overrides TA signal when warranted
+        await _show_caption_message(
+            query,
+            f"🤖 Đang xác nhận tín hiệu *{asset}* bằng Gemini AI...",
+        )
+        signal = await gemini_enhance_signal(signal, asset, timeframe_label)
 
         # Use the live tick price as the entry price so consecutive signals
         # do not share the same stale candle close. Wait briefly for the
