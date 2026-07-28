@@ -85,6 +85,7 @@ class BotPocketClient:
         self._assets_last_update: Optional[float] = None
         self._connected = False
         self._connection_lock = asyncio.Lock()
+        self._candle_request_lock = asyncio.Lock()
         self._latest_prices: Dict[str, float] = {}
 
     @staticmethod
@@ -378,24 +379,47 @@ class BotPocketClient:
         if not self._client.is_connected:
             raise RuntimeError("Chưa kết nối đến PocketOption")
 
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                candles = await self._client._request_candles(asset, timeframe, count, datetime.now())
-                cache_key = f"{asset}_{timeframe}"
-                self._client._candles_cache[cache_key] = candles
-                logger.info(f"Retrieved {len(candles)} candles for {asset}")
-                return candles
-            except Exception as e:
-                if "WebSocket is not connected" in str(e) and attempt < max_retries - 1:
-                    logger.warning(f"Connection lost during candle request for {asset}, retrying...")
-                    if self._client.auto_reconnect:
-                        reconnected = await self._client._attempt_reconnection()
-                        if reconnected:
-                            continue
-                logger.error(f"Failed to get candles for {asset}: {e}")
-                raise PocketOptionError(f"Failed to get candles: {e}")
-        raise PocketOptionError(f"Failed to get candles after {max_retries} attempts")
+        # The library keys pending requests by "{asset}_{timeframe}". Serialize
+        # requests so two users selecting the same pair cannot replace the
+        # other's Future inside the websocket client.
+        async with self._candle_request_lock:
+            max_retries = 2
+            request_counts = [count, min(count, 60)]
+            for attempt in range(max_retries):
+                requested_count = request_counts[attempt]
+                try:
+                    logger.info(
+                        f"Requesting {requested_count} candles for {asset} "
+                        f"(timeframe={timeframe}, attempt={attempt + 1})"
+                    )
+                    candles = await asyncio.wait_for(
+                        self._client._request_candles(
+                            asset, timeframe, requested_count, datetime.now()
+                        ),
+                        timeout=12.0,
+                    )
+                    if candles:
+                        cache_key = f"{asset}_{timeframe}"
+                        self._client._candles_cache[cache_key] = candles
+                        logger.info(f"Retrieved {len(candles)} candles for {asset}")
+                        return candles
+                    logger.warning(
+                        f"PocketOption returned no candles for {asset} "
+                        f"after requesting {requested_count}"
+                    )
+                except Exception as e:
+                    if "WebSocket is not connected" in str(e) and attempt < max_retries - 1:
+                        logger.warning(f"Connection lost during candle request for {asset}, retrying...")
+                        if self._client.auto_reconnect:
+                            reconnected = await self._client._attempt_reconnection()
+                            if reconnected:
+                                continue
+                    if attempt == max_retries - 1:
+                        logger.error(f"Failed to get candles for {asset}: {e}")
+                        raise PocketOptionError(f"Failed to get candles: {e}")
+            raise PocketOptionError(
+                f"PocketOption không trả dữ liệu nến cho {asset}. Vui lòng thử lại."
+            )
 
     async def get_latest_price(self, asset: str, timeframe: int = 60) -> float:
         """Return the latest close price by fetching a few recent candles."""

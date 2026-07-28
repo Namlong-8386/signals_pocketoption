@@ -344,7 +344,10 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     except Exception as e:
         logger.error(f"timeframe_selected error: {e}")
-        await query.edit_message_text(f"❌ Lỗi khi phân tích: {e}\n\nThử /start lại.")
+        await _show_caption_message(
+            query,
+            f"❌ Không thể lấy dữ liệu phân tích: {e}\n\nVui lòng thử lại.",
+        )
         return ConversationHandler.END
 
 
