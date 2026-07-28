@@ -7,8 +7,7 @@ Blending logic
 ──────────────
 • Gemini đồng ý với TA  → confidence = TA*0.55 + Gemini*0.45, hướng giữ nguyên
 • Gemini nói WAIT       → confidence -= 0.10, flip về WAIT nếu < MIN_CONF
-• Gemini bất đồng TA    → confidence -= 0.12;
-  nếu Gemini conf ≥ 68 và TA conf < 0.74 → đổi hướng theo Gemini
+• Gemini bất đồng TA    → chuyển WAIT; Gemini không được tự ý đảo chiều TA
 
 Nếu API lỗi / timeout → giữ nguyên tín hiệu TA, ghi warning.
 """
@@ -152,16 +151,15 @@ async def gemini_enhance_signal(
         new_conf = ta_conf * 0.55 + g_conf * 0.45
 
     else:
-        # Disagreement → penalise TA confidence
-        new_conf = ta_conf - 0.12
-        # Flip only when Gemini is highly confident and TA is not dominant
-        if g_conf >= 0.68 and ta_conf < 0.74 and ta_dir != "WAIT":
-            new_dir = g_dir
-            new_conf = g_conf * 0.80   # slight haircut for the flip
-            logger.info(
-                f"Gemini overrides TA: {ta_dir}→{new_dir} "
-                f"(TA conf {ta_conf:.2f}, Gemini conf {g_conf:.2f})"
-            )
+        # AI is a second opinion, not a signal generator. Flipping a
+        # short-expiry trade based on one language-model response creates
+        # precisely the late entries we want to avoid.
+        new_dir = "WAIT"
+        new_conf = 0.50
+        logger.info(
+            f"Gemini vetoed TA: {ta_dir}→WAIT "
+            f"(TA conf {ta_conf:.2f}, Gemini conf {g_conf:.2f})"
+        )
 
     new_conf = round(min(0.95, max(0.50, new_conf)), 2)
 

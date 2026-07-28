@@ -418,10 +418,21 @@ def analyze_candles(candles: List[Candle],
     # ── Market regime ─────────────────────────────────────────────────────
     # ADX ≥ 25 = trending; bandwidth squeeze = potential breakout
     trending  = adx_v["adx"] >= 25
-    very_flat = adx_v["adx"] < 15          # not worth trading
+    very_flat = adx_v["adx"] < 17          # binary options: avoid chop
     bw_avg    = _sma([abs(cl[i] - cl[i-1]) for i in range(1, len(cl))], 20)
     atr_pct   = atr_v / max(price, 1e-12)
     low_vol   = atr_pct < 0.0004            # < 0.04 % per candle
+
+    # Short-expiry trades need a live impulse, not only an indicator vote.
+    # A last candle that contradicts the proposed direction is usually a
+    # late/weak entry and is deliberately rejected below.
+    prev_body = sc[-2].close - sc[-2].open
+    last_body = sc[-1].close - sc[-1].open
+    last_range = max(sc[-1].high - sc[-1].low, 1e-12)
+    candle_body_ratio = abs(last_body) / last_range
+    recent_move = cl[-1] - cl[-3]
+    recent_direction = 1 if recent_move > 0 else -1 if recent_move < 0 else 0
+    ema21_slope = (ema21 - ema21s[-4]) / max(price, 1e-12) if len(ema21s) >= 4 else 0.0
 
     # ── TREND category ────────────────────────────────────────────────────
     t_c = t_p = 0.0
@@ -619,16 +630,56 @@ def analyze_candles(candles: List[Candle],
     else:
         raw_conf = 0.5
 
-    # Penalty: every flat-market indicator reduces confidence
-    if very_flat:
-        raw_conf -= 0.10
-    if low_vol:
-        raw_conf -= 0.05
+    # Reject low-quality market conditions instead of merely lowering a
+    # confidence number. A 60% confidence label is still a bad trade in chop.
+    if very_flat or low_vol:
+        direction = "WAIT"
+        raw_conf = 0.50
+
+    # Confirm direction with the last two candles. Counter-trend reversals
+    # are allowed only with a strong exhaustion setup and a reversal pattern.
+    reversal_bull = bool(set(bull_p) & {
+        "Hammer", "Bullish Engulfing", "Morning Star", "Tweezer Bottom"
+    }) and rsi <= 35
+    reversal_bear = bool(set(bear_p) & {
+        "Shooting Star", "Bearish Engulfing", "Evening Star", "Tweezer Top"
+    }) and rsi >= 65
+    if direction == "CALL":
+        impulse_ok = recent_direction == 1 and last_body > 0
+        if not impulse_ok and not reversal_bull:
+            direction = "WAIT"
+            raw_conf = 0.50
+    elif direction == "PUT":
+        impulse_ok = recent_direction == -1 and last_body < 0
+        if not impulse_ok and not reversal_bear:
+            direction = "WAIT"
+            raw_conf = 0.50
+
+    # In a clear trend, do not fade the trend merely because oscillators are
+    # overbought/oversold. This is a common source of repeated binary losses.
+    if trending and direction == "CALL" and adx_v["minus_di"] > adx_v["plus_di"]:
+        direction = "WAIT"
+        raw_conf = 0.50
+    elif trending and direction == "PUT" and adx_v["plus_di"] > adx_v["minus_di"]:
+        direction = "WAIT"
+        raw_conf = 0.50
+
+    # Require a meaningful category edge, not just two barely winning votes.
+    winning_scores = [t_score, o_score, a_score]
+    if direction in ("CALL", "PUT"):
+        sign = 1 if direction == "CALL" else -1
+        weighted_edge = sum(
+            weights[i] * (winning_scores[i] - 0.5) * (1 if dirs[i] == sign else -1)
+            for i in range(3)
+        )
+        if weighted_edge < 0.075:
+            direction = "WAIT"
+            raw_conf = 0.50
 
     confidence = round(min(0.95, max(0.50, raw_conf)), 2)
 
     # Raise confidence bar: only emit strong signals
-    MIN_CONF = 0.62
+    MIN_CONF = 0.68
     if direction != "WAIT" and confidence < MIN_CONF:
         direction = "WAIT"
 
@@ -679,6 +730,9 @@ def analyze_candles(candles: List[Candle],
             "adx":            adx_v,
             "atr":            atr_v,
             "atr_pct":        round(atr_pct * 100, 4),
+            "candle_body_ratio": round(candle_body_ratio, 3),
+            "recent_direction": recent_direction,
+            "ema21_slope": round(ema21_slope * 100, 5),
             "supertrend":     st,
             "ha_direction":   ha,
             "price_structure": struct,
