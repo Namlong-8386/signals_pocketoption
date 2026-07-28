@@ -1,3 +1,4 @@
 - [PocketOption websockets compatibility](pocketoption-websockets.md) — library needs `websockets<14.0` because newer versions drop `extra_headers`.
 - [PocketOption fallback asset categorization](pocketoption-asset-categories.md) — server fallback list reports `type: unknown`; categorize by symbol patterns.
 - [Telegram bot token conflicts](telegram-token-conflicts.md) — only one bot instance per token can poll; conflicts cause silent `getUpdates` failures.
+- [PocketOption candle/catalog handling](pocketoption-candle-catalog.md) — use the client candle API and keep Forex menu independent of temporary payout snapshots.

@@ -32,6 +32,18 @@ _FOREX_CURRENCIES = {
     "SGD", "THB", "TRY", "TWD", "USD", "VND", "ZAR",
 }
 
+_COMMON_FOREX_PAIRS = {
+    # Major and commonly offered minor pairs.  The broker sometimes omits
+    # REAL pairs from its payout snapshot even though candle history supports
+    # them, so the menu must not depend exclusively on that snapshot.
+    "AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD", "AUDUSD",
+    "CADCHF", "CADJPY", "CHFJPY", "EURAUD", "EURCAD",
+    "EURCHF", "EURGBP", "EURJPY", "EURNZD", "EURUSD",
+    "GBPAUD", "GBPCAD", "GBPCHF", "GBPJPY", "GBPNZD", "GBPUSD",
+    "NZDCAD", "NZDJPY", "NZDUSD", "USDCAD", "USDCHF",
+    "USDJPY", "USDMXN", "USDNOK", "USDPLN", "USDSEK", "USDTRY",
+}
+
 _STOCK_NAME_MARKERS = {
     "APPLE", "AMAZON", "AMERICANEXPRESS", "BOEING", "FACEBOOK",
     "MICROSOFT", "NETFLIX", "TESLA", "TWITTER",
@@ -77,6 +89,16 @@ def get_asset_category(symbol: str) -> str:
     if s in _INDEX_SYMBOLS or any(ch.isdigit() for ch in symbol):
         return "index"
     return "forex"
+
+
+def is_forex_pair(symbol: str) -> bool:
+    """Return True only for a plain six-letter currency pair."""
+    raw = symbol.upper().strip()
+    return (
+        re.fullmatch(r"[A-Z]{6}", raw) is not None
+        and raw[:3] in _FOREX_CURRENCIES
+        and raw[3:] in _FOREX_CURRENCIES
+    )
 
 
 def get_category_label(category: str) -> str:
@@ -202,6 +224,14 @@ class BotPocketClient:
                 }
                 self._assets_last_update = datetime.now().timestamp()
                 logger.info(f"Fallback asset list loaded: {len(self._assets)} assets")
+            # Keep the normal REAL currency universe available.  The server's
+            # payout/updateAssets packet is not a complete market catalogue
+            # and may mark an otherwise requestable pair as closed temporarily.
+            for symbol in _COMMON_FOREX_PAIRS:
+                self._assets.setdefault(
+                    symbol,
+                    {"is_otc": False, "tradable": True, "id": LIBRARY_ASSETS.get(symbol)},
+                )
             logger.info("Connected to PocketOption.")
             return True
 
@@ -359,7 +389,7 @@ class BotPocketClient:
         return sorted(
             [
                 sym for sym, info in self._assets.items()
-                if get_asset_category(sym) == "forex" and info.get("tradable")
+                if is_forex_pair(sym)
             ]
         )
 
@@ -383,8 +413,13 @@ class BotPocketClient:
     def list_assets_by_category(self, category: str) -> List[str]:
         """Return sorted tradable assets for a given category."""
         return sorted(
-            [sym for sym, info in self._assets.items()
-             if get_asset_category(sym) == category and info.get("tradable")]
+            [
+                sym for sym, info in self._assets.items()
+                if (
+                    is_forex_pair(sym) if category == "forex"
+                    else get_asset_category(sym) == category and info.get("tradable")
+                )
+            ]
         )
 
     async def get_candles(self, asset: str, timeframe: int, count: int = ANALYSIS_CANDLE_COUNT) -> List[Candle]:
@@ -412,8 +447,16 @@ class BotPocketClient:
                         f"Requesting {requested_count} candles for {asset} "
                         f"(timeframe={timeframe}, attempt={attempt + 1})"
                     )
+                    # Use the library's public method when its asset catalogue
+                    # knows the symbol. Server-only symbols bypass validation
+                    # but still use the same underlying candle request.
+                    candle_call = (
+                        self._client.get_candles
+                        if asset in LIBRARY_ASSETS
+                        else self._client._request_candles
+                    )
                     candles = await asyncio.wait_for(
-                        self._client._request_candles(
+                        candle_call(
                             asset, timeframe, requested_count, datetime.now()
                         ),
                         timeout=12.0,
