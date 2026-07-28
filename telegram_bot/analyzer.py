@@ -8,7 +8,7 @@ from pocketoptionapi_async.models import Candle
 
 @dataclass
 class SignalResult:
-    direction: str  # "CALL" or "PUT"
+    direction: str  # "CALL", "PUT", or "WAIT"
     confidence: float  # 0.0 - 1.0
     price: float
     reasons: List[str]
@@ -92,6 +92,49 @@ def _stochastic(highs: List[float], lows: List[float], closes: List[float], peri
     return {"k": values[-1], "d": _mean(values, 3)}
 
 
+def _williams_r(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    if len(closes) < period:
+        return -50.0
+    high = max(highs[-period:])
+    low = min(lows[-period:])
+    return -50.0 if high == low else -100.0 * (high - closes[-1]) / (high - low)
+
+
+def _candle_patterns(candles: List[Candle]) -> List[str]:
+    """Return confirmed patterns on the last candle, if any."""
+    if len(candles) < 2:
+        return []
+    current, previous = candles[-1], candles[-2]
+    body = abs(current.close - current.open)
+    candle_range = max(current.high - current.low, 1e-12)
+    upper = current.high - max(current.open, current.close)
+    lower = min(current.open, current.close) - current.low
+    previous_body = previous.close - previous.open
+    patterns: List[str] = []
+    # Doji: body is at most 10% of total range.
+    if body / candle_range <= 0.10:
+        patterns.append("Doji")
+    if lower >= body * 2.0 and upper <= max(body, candle_range * 0.20):
+        patterns.append("Hammer")
+    if upper >= body * 2.0 and lower <= max(body, candle_range * 0.20):
+        patterns.append("Shooting Star")
+    if (
+        current.close > current.open
+        and previous_body < 0
+        and current.open <= previous.close
+        and current.close >= previous.open
+    ):
+        patterns.append("Bullish Engulfing")
+    if (
+        current.close < current.open
+        and previous_body > 0
+        and current.open >= previous.close
+        and current.close <= previous.open
+    ):
+        patterns.append("Bearish Engulfing")
+    return patterns
+
+
 def _cci(highs: List[float], lows: List[float], closes: List[float], period: int = 20) -> float:
     if len(closes) < period:
         return 0.0
@@ -145,6 +188,7 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
     macd_val = _macd(closes)
     bb = _bollinger(closes)
     stochastic = _stochastic(highs, lows, closes)
+    williams = _williams_r(highs, lows, closes)
     cci_val = _cci(highs, lows, closes)
     atr_val = _atr(highs, lows, closes)
     adx = _adx(highs, lows, closes)
@@ -153,6 +197,7 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
     last_5 = closes[-5:]
     trend_up = sum(last_5[i] > last_5[i - 1] for i in range(1, len(last_5)))
     trend_down = sum(last_5[i] < last_5[i - 1] for i in range(1, len(last_5)))
+    patterns = _candle_patterns(sorted_candles)
     call_score = put_score = 0.0
     reasons: List[str] = []
 
@@ -207,6 +252,14 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
         put_score += 1.0
         reasons.append(f"CCI {cci_val:.0f}: quá mua")
 
+    # Williams %R confirms the oscillator reversal zone.
+    if williams <= -80:
+        call_score += 1.0
+        reasons.append(f"Williams %R {williams:.1f}: quá bán")
+    elif williams >= -20:
+        put_score += 1.0
+        reasons.append(f"Williams %R {williams:.1f}: quá mua")
+
     # Candle confirmation: engulfing, rejection wick, then strong body.
     candle, previous = sorted_candles[-1], sorted_candles[-2]
     body = candle.close - candle.open
@@ -217,12 +270,18 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
     lower_wick = min(candle.open, candle.close) - candle.low
     bullish_engulf = body > 0 and previous_body < 0 and candle.close >= previous.open and candle.open <= previous.close
     bearish_engulf = body < 0 and previous_body > 0 and candle.close <= previous.open and candle.open >= previous.close
-    if bullish_engulf or (body > 0 and lower_wick >= abs(body) * 1.5):
+    if "Bullish Engulfing" in patterns or "Hammer" in patterns:
         call_score += 1.0
-        reasons.append("Nến xác nhận CALL")
-    elif bearish_engulf or (body < 0 and upper_wick >= abs(body) * 1.5):
+        reasons.append("Mẫu nến CALL: " + ", ".join(
+            p for p in patterns if p in ("Bullish Engulfing", "Hammer")
+        ))
+    elif "Bearish Engulfing" in patterns or "Shooting Star" in patterns:
         put_score += 1.0
-        reasons.append("Nến xác nhận PUT")
+        reasons.append("Mẫu nến PUT: " + ", ".join(
+            p for p in patterns if p in ("Bearish Engulfing", "Shooting Star")
+        ))
+    elif "Doji" in patterns:
+        reasons.append("Doji: thị trường lưỡng lự, giảm độ tin cậy")
     elif body_ratio >= 0.55:
         if body > 0:
             call_score += 0.45
@@ -246,11 +305,14 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
         put_score += 0.6
 
     total = call_score + put_score
-    direction = "CALL" if call_score >= put_score else "PUT"
+    direction = "CALL" if call_score > put_score else "PUT"
     winning_score = max(call_score, put_score)
     confidence = min(0.95, max(0.5, winning_score / total if total else 0.5))
-    if abs(call_score - put_score) < 1.0:
-        reasons.append("Tín hiệu giằng co — nên thận trọng")
+    # A weak edge or a tie is WAIT rather than a forced trade direction.
+    if call_score == put_score or confidence < 0.58:
+        direction = "WAIT"
+        confidence = round(confidence, 2)
+        reasons.append("WAIT: độ tin cậy dưới 58% hoặc hai phe hòa điểm")
 
     return SignalResult(
         direction=direction,
@@ -265,6 +327,7 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
             "macd": macd_val,
             "bollinger": bb,
             "stochastic": stochastic,
+            "williams_r": williams,
             "cci": cci_val,
             "adx": adx,
             "atr": atr_val,
@@ -272,6 +335,7 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
             "resistance": resistance,
             "call_score": round(call_score, 2),
             "put_score": round(put_score, 2),
+            "patterns": patterns,
             "trend_up": trend_up,
             "trend_down": trend_down,
             "candles": len(closes),

@@ -22,7 +22,7 @@ TIMEFRAMES = {
 }
 
 # Candles used for technical analysis
-ANALYSIS_CANDLE_COUNT = 80
+ANALYSIS_CANDLE_COUNT = 120
 
 # How often to refresh asset lists from the API (seconds)
 ASSET_CACHE_TTL = 120

@@ -292,7 +292,10 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "chat_id": query.message.chat_id,
         }
 
-        direction_emoji = "🟢 CALL" if signal.direction == "CALL" else "🔴 PUT"
+        if signal.direction == "WAIT":
+            direction_emoji = "⏸ WAIT"
+        else:
+            direction_emoji = "🟢 CALL" if signal.direction == "CALL" else "🔴 PUT"
         reasons_text = "\n".join(f"• {r}" for r in signal.reasons)
 
         text = (
@@ -302,14 +305,24 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"📈 Hướng: *{direction_emoji}*\n"
             f"🎯 Độ tin cậy: *{int(signal.confidence * 100)}%*\n\n"
             f"*Lý do:*\n{reasons_text}\n\n"
-            f"⏱ Kết quả sẽ được cập nhật sau *{tf_key}*."
+            +
+            (
+                f"⏱ Kết quả sẽ được cập nhật sau *{tf_key}*."
+                if signal.direction != "WAIT"
+                else "⏸ Chưa đủ điều kiện xác nhận — bot không khuyến nghị vào lệnh."
+            )
         )
 
         keyboard = [
             [InlineKeyboardButton("🔔 Nhận tín hiệu mới", callback_data="new_signal")],
             [InlineKeyboardButton("🏠 Menu chính", callback_data="back_market")],
         ]
-        signal_image = CALL_IMAGE if signal.direction == "CALL" else PUT_IMAGE
+        # WAIT has no directional trade image and must not look like a PUT.
+        signal_image = (
+            CALL_IMAGE if signal.direction == "CALL"
+            else PUT_IMAGE if signal.direction == "PUT"
+            else TIMEFRAME_IMAGE
+        )
         await _show_photo_message(
             query,
             signal_image,
@@ -317,14 +330,15 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
             InlineKeyboardMarkup(keyboard),
         )
 
-        # Schedule result update. Pass a snapshot of the signal data so the
-        # update task is independent from any future signals the user requests.
-        asyncio.create_task(
-            _update_result_after_delay(
-                context.application,
-                dict(active_signals[user_id]),
+        if signal.direction != "WAIT":
+            # Schedule result update. Pass a snapshot of the signal data so the
+            # update task is independent from any future signals the user requests.
+            asyncio.create_task(
+                _update_result_after_delay(
+                    context.application,
+                    dict(active_signals[user_id]),
+                )
             )
-        )
 
         return SIGNAL_SENT
 
