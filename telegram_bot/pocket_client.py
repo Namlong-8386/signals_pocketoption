@@ -174,6 +174,10 @@ class BotPocketClient:
             )
             # Attach directly to the websocket client so we receive asset data
             self._client._websocket.add_event_handler("payout_update", self._on_payout_update)
+            # PocketOption currently emits the asset snapshot as updateAssets.
+            # Keep the legacy binary name as well for older server/client
+            # combinations.
+            self._client._websocket.add_event_handler("updateAssets", self._on_assets_update)
             self._client._websocket.add_event_handler("binary_updateAssets", self._on_assets_update)
             self._client._websocket.add_event_handler("json_data", self._on_json_data)
             self._client.add_event_callback("disconnected", self._on_disconnected)
@@ -328,6 +332,21 @@ class BotPocketClient:
         """
         try:
             if isinstance(data, list):
+                # The updateAssets Socket.IO message arrives with a
+                # placeholder event followed by its full payload through
+                # json_data. Asset rows have an id, symbol, metadata and an
+                # explicit open/tradable flag at index 14; they are not ticks.
+                asset_rows = [
+                    item for item in data
+                    if isinstance(item, list)
+                    and len(item) > 14
+                    and isinstance(item[1], str)
+                    and isinstance(item[14], bool)
+                ]
+                if asset_rows:
+                    self._on_assets_update(data)
+                    return
+
                 for item in data:
                     if isinstance(item, (list, tuple)) and len(item) >= 3:
                         symbol = str(item[0])
