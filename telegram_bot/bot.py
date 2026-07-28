@@ -1,6 +1,7 @@
 """Telegram bot logic for PocketOption trading signals."""
 import asyncio
 import logging
+from collections import defaultdict, deque
 from typing import Dict, Any
 from datetime import datetime
 
@@ -24,6 +25,10 @@ CHOOSING_MARKET, CHOOSING_ASSET, CHOOSING_TIMEFRAME, SIGNAL_SENT = range(4)
 # In-memory store for active signals keyed by user_id
 active_signals: Dict[int, Dict[str, Any]] = {}
 active_signal_tasks: Dict[int, asyncio.Task] = {}
+# Keep a small per-market result history so a temporarily bad regime cannot
+# produce an uninterrupted sequence of recommendations.
+recent_results: Dict[tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=8))
+market_cooldowns: Dict[tuple[str, str], float] = {}
 
 # Shared PocketOption client
 pocket_client = BotPocketClient()
@@ -353,6 +358,31 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         signal.price = current_price
         logger.info(f"Using live price for {asset}: {current_price}")
 
+        market_key = (asset, timeframe_label)
+        now_monotonic = asyncio.get_running_loop().time()
+        cooldown_until = market_cooldowns.get(market_key, 0.0)
+        if cooldown_until > now_monotonic:
+            remaining = int(cooldown_until - now_monotonic)
+            signal.direction = "WAIT"
+            signal.confidence = min(signal.confidence, 0.50)
+            signal.reasons.append(
+                f"WAIT: {asset} đang tạm dừng sau chuỗi thua; thử lại sau khoảng {remaining}s"
+            )
+        elif signal.direction != "WAIT":
+            # A 54% score is not enough to justify a short-expiry trade. Require
+            # both a stronger margin and at least one confirming walk-forward
+            # result when enough historical samples are available.
+            validation = signal.indicators.get("walk_forward", {})
+            if signal.confidence < 0.58 or (
+                validation.get("samples", 0) >= 20
+                and validation.get("accuracy", 0.5) < 0.50
+            ):
+                signal.direction = "WAIT"
+                signal.confidence = min(signal.confidence, 0.57)
+                signal.reasons.append(
+                    "WAIT: lợi thế chưa đủ mạnh hoặc kiểm định gần đây đang bất lợi"
+                )
+
         entry_time = datetime.now()
         user_id = update.effective_user.id
 
@@ -505,6 +535,25 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
         result = evaluate_signal(signal, exit_price)
 
         won = result["won"]
+        market_key = (asset, tf_key)
+        recent_results[market_key].append(bool(won))
+        history = recent_results[market_key]
+        consecutive_losses = 0
+        for outcome in reversed(history):
+            if outcome:
+                break
+            consecutive_losses += 1
+        if consecutive_losses >= 2:
+            # Pause only this asset/timeframe, rather than disabling the whole
+            # bot. This avoids repeatedly trading a regime that just failed.
+            cooldown_seconds = max(120, signal_data["timeframe_seconds"] * 3)
+            market_cooldowns[market_key] = (
+                asyncio.get_running_loop().time() + cooldown_seconds
+            )
+            logger.warning(
+                f"Pausing {asset} {tf_key} after {consecutive_losses} consecutive losses "
+                f"for {cooldown_seconds}s"
+            )
         outcome = "✅ WIN" if won else "❌ LOSS"
         direction_text = "CALL" if signal.direction == "CALL" else "PUT"
 
