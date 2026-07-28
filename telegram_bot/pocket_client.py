@@ -89,6 +89,7 @@ from telegram_bot.config import (
     POCKETOPTION_PLATFORM,
     ANALYSIS_CANDLE_COUNT,
     ASSET_CACHE_TTL,
+    RESULT_CANDLE_COUNT,
 )
 
 
