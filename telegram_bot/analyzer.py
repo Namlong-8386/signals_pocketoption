@@ -1,745 +1,588 @@
-"""Technical analysis helpers for PocketOption signals.
+"""Technical analysis engine for PocketOption signals.
 
-Upgrade notes
-─────────────
-* Wilder-smoothed RSI and ADX instead of simple-average approximations.
-* Supertrend (ATR-based) added as a primary trend indicator.
-* Heikin-Ashi direction smooths out noise candle-by-candle.
-* Price structure (HH/HL vs LH/LL) detects confirmed trend direction.
-* RSI divergence (bullish / bearish) catches early reversals.
-* MACD crossover detection replaces simple histogram-sign test.
-* EMA-50 added as a long-term trend filter.
-* Extended candle patterns: Morning Star, Evening Star,
-  Three White Soldiers, Three Black Crows, Tweezer Top/Bottom.
-* Categorical confluence scoring:
-    TREND     – EMA, Supertrend, HA, ADX, MACD crossover, price structure
-    OSCILLATOR – RSI, Stochastic, Williams %R, CCI, momentum, divergence
-    PRICE_ACT  – patterns, Bollinger, S/R proximity
-  Signal is only emitted when ≥ 2 of 3 categories agree; this prevents a
-  single strong indicator from overriding a conflicted market.
-* Volatility filter: very low ATR suppresses confidence.
-* Walk-forward validation kept as optional calibration layer.
+Architecture
+────────────
+1. Market-regime detection (trending vs ranging) via ADX + Bollinger bandwidth.
+2. Three independent voting categories:
+     TREND      – EMA stack, Supertrend, Heikin-Ashi, MACD crossover,
+                  price structure, ADX direction
+     OSCILLATOR – RSI (Wilder), Stochastic, Williams %R, CCI, momentum,
+                  RSI divergence
+     PRICE_ACT  – candle patterns, Bollinger bands, S/R proximity
+3. Regime-aware weighting:
+     trending  → TREND carries 55 %, OSCILLATOR 25 %, PRICE_ACT 20 %
+     ranging   → OSCILLATOR carries 50 %, TREND 20 %, PRICE_ACT 30 %
+4. Signal fires only when ≥ 2 of 3 categories agree AND
+   the weighted category-score margin exceeds a threshold.
+5. Walk-forward validation removed entirely.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple
 
 from pocketoptionapi_async.models import Candle
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Data structure
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Data class
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class SignalResult:
-    direction: str          # "CALL", "PUT", or "WAIT"
+    direction: str          # "CALL" | "PUT" | "WAIT"
     confidence: float       # 0.0 – 1.0
     price: float
     reasons: List[str]
-    indicators: Dict[str, Any]
+    indicators: Dict[str, Any] = field(default_factory=dict)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Low-level maths helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure maths helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _sma(values: List[float], period: int) -> float:
-    window = values[-period:]
-    return sum(window) / len(window) if window else 0.0
+def _sma(v: List[float], p: int) -> float:
+    w = v[-p:]
+    return sum(w) / len(w) if w else 0.0
 
 
 def _ema(values: List[float], period: int) -> List[float]:
-    """Standard EMA – returns the full series aligned to *values*."""
     if len(values) < period:
-        return values[:]
+        return list(values)
     k = 2.0 / (period + 1.0)
-    result = [_sma(values[:period], period)]
-    for v in values[period:]:
-        result.append(v * k + result[-1] * (1.0 - k))
-    return result
+    out = [_sma(values[:period], period)]
+    for x in values[period:]:
+        out.append(x * k + out[-1] * (1.0 - k))
+    return out
 
 
-def _wilder_smooth(values: List[float], period: int) -> List[float]:
-    """Wilder's smoothing (used by RSI and ADX)."""
+def _wilder(values: List[float], period: int) -> List[float]:
+    """Wilder's smoothing – used by RSI and ADX."""
     if len(values) < period:
         return [0.0] * len(values)
     seed = sum(values[:period]) / period
-    result = [0.0] * (period - 1) + [seed]
+    out: List[float] = [0.0] * (period - 1) + [seed]
     k = 1.0 / period
-    for v in values[period:]:
-        result.append(result[-1] * (1.0 - k) + v * k)
-    return result
+    for x in values[period:]:
+        out.append(out[-1] * (1.0 - k) + x * k)
+    return out
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Indicators
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _rsi(closes: List[float], period: int = 14) -> float:
-    """RSI via Wilder's smoothing (the standard definition)."""
     if len(closes) < period + 1:
         return 50.0
-    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains = [max(c, 0.0) for c in changes]
-    losses = [max(-c, 0.0) for c in changes]
-    s_gains = _wilder_smooth(gains, period)
-    s_losses = _wilder_smooth(losses, period)
-    ag, al = s_gains[-1], s_losses[-1]
-    if al == 0.0:
-        return 100.0
-    rs = ag / al
-    return 100.0 - 100.0 / (1.0 + rs)
+    chg = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    sg = _wilder([max(c, 0.0) for c in chg], period)
+    sl = _wilder([max(-c, 0.0) for c in chg], period)
+    ag, al = sg[-1], sl[-1]
+    return 100.0 if al == 0.0 else 100.0 - 100.0 / (1.0 + ag / al)
 
 
 def _rsi_series(closes: List[float], period: int = 14) -> List[float]:
-    """Full RSI series (needed for divergence detection)."""
     if len(closes) < period + 1:
         return [50.0] * len(closes)
-    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains = [max(c, 0.0) for c in changes]
-    losses = [max(-c, 0.0) for c in changes]
-    s_gains = _wilder_smooth(gains, period)
-    s_losses = _wilder_smooth(losses, period)
-    rsi = []
-    for ag, al in zip(s_gains, s_losses):
-        if al == 0.0:
-            rsi.append(100.0)
-        else:
-            rsi.append(100.0 - 100.0 / (1.0 + ag / al))
-    # Pad the front to match closes length (one fewer change)
-    return [50.0] + rsi
+    chg = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    sg = _wilder([max(c, 0.0) for c in chg], period)
+    sl = _wilder([max(-c, 0.0) for c in chg], period)
+    series = [50.0]
+    for ag, al in zip(sg, sl):
+        series.append(100.0 if al == 0.0 else 100.0 - 100.0 / (1.0 + ag / al))
+    return series
 
 
-def _macd(closes: List[float], fast: int = 12, slow: int = 26,
-          signal: int = 9) -> Dict[str, float]:
+def _macd(closes: List[float], fast=12, slow=26, sig=9) -> Dict[str, float]:
     ef = _ema(closes, fast)
     es = _ema(closes, slow)
-    macd_line = [f - s for f, s in zip(ef[-len(es):], es)]
-    if len(macd_line) < signal:
-        return {"macd": 0.0, "signal": 0.0, "histogram": 0.0,
-                "crossover": 0, "prev_histogram": 0.0}
-    sig_line = _ema(macd_line, signal)
-    histogram = macd_line[-1] - sig_line[-1]
-    prev_histogram = (macd_line[-2] - sig_line[-2]) if len(macd_line) >= 2 and len(sig_line) >= 2 else 0.0
-    # Crossover: +1 bullish (MACD crossed above signal), -1 bearish
-    crossover = 0
-    if len(macd_line) >= 2 and len(sig_line) >= 2:
-        if macd_line[-2] <= sig_line[-2] and macd_line[-1] > sig_line[-1]:
-            crossover = 1
-        elif macd_line[-2] >= sig_line[-2] and macd_line[-1] < sig_line[-1]:
-            crossover = -1
-    return {
-        "macd": macd_line[-1],
-        "signal": sig_line[-1],
-        "histogram": histogram,
-        "prev_histogram": prev_histogram,
-        "crossover": crossover,
-    }
+    ml = [f - s for f, s in zip(ef[-len(es):], es)]
+    if len(ml) < sig:
+        return {"macd": 0.0, "signal": 0.0, "histogram": 0.0, "crossover": 0}
+    sl2 = _ema(ml, sig)
+    hist = ml[-1] - sl2[-1]
+    xo = 0
+    if len(ml) >= 2 and len(sl2) >= 2:
+        if ml[-2] <= sl2[-2] and ml[-1] > sl2[-1]:
+            xo = 1
+        elif ml[-2] >= sl2[-2] and ml[-1] < sl2[-1]:
+            xo = -1
+    return {"macd": ml[-1], "signal": sl2[-1], "histogram": hist, "crossover": xo}
 
 
-def _bollinger(closes: List[float], period: int = 20,
-               std_dev: float = 2.0) -> Dict[str, float]:
+def _bollinger(closes: List[float], period=20, mult=2.0) -> Dict[str, float]:
     if len(closes) < period:
-        return {"upper": closes[-1], "middle": closes[-1], "lower": closes[-1],
-                "bandwidth": 0.0, "percent_b": 0.5}
-    window = closes[-period:]
-    middle = sum(window) / period
-    variance = sum((x - middle) ** 2 for x in window) / period
-    band = math.sqrt(variance) * std_dev
-    upper, lower = middle + band, middle - band
-    width = upper - lower
-    percent_b = (closes[-1] - lower) / width if width > 1e-12 else 0.5
-    return {"upper": upper, "middle": middle, "lower": lower,
-            "bandwidth": width, "percent_b": percent_b}
+        return {"upper": closes[-1], "middle": closes[-1],
+                "lower": closes[-1], "pct_b": 0.5, "bandwidth": 0.0}
+    w = closes[-period:]
+    mid = sum(w) / period
+    std = math.sqrt(sum((x - mid) ** 2 for x in w) / period)
+    up, lo = mid + mult * std, mid - mult * std
+    bw = up - lo
+    pct = (closes[-1] - lo) / bw if bw > 1e-12 else 0.5
+    return {"upper": up, "middle": mid, "lower": lo,
+            "pct_b": pct, "bandwidth": bw}
 
 
-def _atr(highs: List[float], lows: List[float], closes: List[float],
-         period: int = 14) -> float:
-    if len(closes) < 2:
+def _atr(hi: List[float], lo: List[float], cl: List[float], period=14) -> float:
+    if len(cl) < 2:
         return 0.0
-    trs = [
-        max(highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]))
-        for i in range(1, len(closes))
-    ]
-    smoothed = _wilder_smooth(trs, period)
-    return smoothed[-1] if smoothed else 0.0
+    trs = [max(hi[i] - lo[i], abs(hi[i] - cl[i-1]), abs(lo[i] - cl[i-1]))
+           for i in range(1, len(cl))]
+    return _wilder(trs, period)[-1]
 
 
-def _stochastic(highs: List[float], lows: List[float], closes: List[float],
-                k_period: int = 14, d_period: int = 3) -> Dict[str, float]:
-    if len(closes) < k_period:
+def _stochastic(hi: List[float], lo: List[float], cl: List[float],
+                kp=14, dp=3) -> Dict[str, float]:
+    if len(cl) < kp:
         return {"k": 50.0, "d": 50.0}
-    k_values: List[float] = []
-    for end in range(k_period, len(closes) + 1):
-        h = max(highs[end - k_period:end])
-        l = min(lows[end - k_period:end])
-        k_values.append(50.0 if h == l else 100.0 * (closes[end - 1] - l) / (h - l))
-    d = _sma(k_values, d_period)
-    return {"k": k_values[-1], "d": d}
+    ks = []
+    for end in range(kp, len(cl) + 1):
+        h, l = max(hi[end-kp:end]), min(lo[end-kp:end])
+        ks.append(50.0 if h == l else 100.0 * (cl[end-1] - l) / (h - l))
+    return {"k": ks[-1], "d": _sma(ks, dp)}
 
 
-def _williams_r(highs: List[float], lows: List[float], closes: List[float],
-                period: int = 14) -> float:
-    if len(closes) < period:
+def _williams_r(hi: List[float], lo: List[float], cl: List[float], p=14) -> float:
+    if len(cl) < p:
         return -50.0
-    h = max(highs[-period:])
-    l = min(lows[-period:])
-    return -50.0 if h == l else -100.0 * (h - closes[-1]) / (h - l)
+    h, l = max(hi[-p:]), min(lo[-p:])
+    return -50.0 if h == l else -100.0 * (h - cl[-1]) / (h - l)
 
 
-def _cci(highs: List[float], lows: List[float], closes: List[float],
-         period: int = 20) -> float:
-    if len(closes) < period:
+def _cci(hi: List[float], lo: List[float], cl: List[float], p=20) -> float:
+    if len(cl) < p:
         return 0.0
-    typical = [(h + l + c) / 3.0 for h, l, c in zip(highs, lows, closes)]
-    window = typical[-period:]
-    mean = sum(window) / period
-    deviation = sum(abs(v - mean) for v in window) / period
-    return 0.0 if deviation == 0 else (window[-1] - mean) / (0.015 * deviation)
+    tp = [(h + l + c) / 3 for h, l, c in zip(hi, lo, cl)]
+    w = tp[-p:]
+    m = sum(w) / p
+    dev = sum(abs(x - m) for x in w) / p
+    return 0.0 if dev == 0 else (w[-1] - m) / (0.015 * dev)
 
 
-def _adx_wilder(highs: List[float], lows: List[float], closes: List[float],
-                period: int = 14) -> Dict[str, float]:
-    """ADX with proper Wilder smoothing."""
-    if len(closes) < period + 2:
+def _adx(hi: List[float], lo: List[float], cl: List[float],
+         period=14) -> Dict[str, float]:
+    if len(cl) < period + 2:
         return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
-    trs, plus_dm, minus_dm = [], [], []
-    for i in range(1, len(closes)):
-        trs.append(max(highs[i] - lows[i],
-                       abs(highs[i] - closes[i - 1]),
-                       abs(lows[i] - closes[i - 1])))
-        up = highs[i] - highs[i - 1]
-        dn = lows[i - 1] - lows[i]
-        plus_dm.append(up if up > dn and up > 0 else 0.0)
-        minus_dm.append(dn if dn > up and dn > 0 else 0.0)
-
-    str14 = _wilder_smooth(trs, period)
-    pdi14 = _wilder_smooth(plus_dm, period)
-    mdi14 = _wilder_smooth(minus_dm, period)
-    if not str14:
+    trs, pdm, mdm = [], [], []
+    for i in range(1, len(cl)):
+        trs.append(max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1])))
+        up = hi[i] - hi[i-1]
+        dn = lo[i-1] - lo[i]
+        pdm.append(up if up > dn and up > 0 else 0.0)
+        mdm.append(dn if dn > up and dn > 0 else 0.0)
+    atr_w = _wilder(trs, period)
+    pdi_w = _wilder(pdm, period)
+    mdi_w = _wilder(mdm, period)
+    last_atr = atr_w[-1]
+    if last_atr == 0:
         return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
-    atr14 = str14[-1]
-    plus_di = 100.0 * pdi14[-1] / atr14 if atr14 else 0.0
-    minus_di = 100.0 * mdi14[-1] / atr14 if atr14 else 0.0
-    dx_vals = []
-    for a, b, c in zip(str14, pdi14, mdi14):
+    plus_di  = 100.0 * pdi_w[-1] / last_atr
+    minus_di = 100.0 * mdi_w[-1] / last_atr
+    dx_list: List[float] = []
+    for a, p2, m in zip(atr_w, pdi_w, mdi_w):
         if a == 0:
             continue
-        pdi = 100.0 * b / a
-        mdi = 100.0 * c / a
-        denom = pdi + mdi
-        dx_vals.append(100.0 * abs(pdi - mdi) / denom if denom else 0.0)
-    adx_series = _wilder_smooth(dx_vals, period)
-    return {
-        "adx": adx_series[-1] if adx_series else 0.0,
-        "plus_di": plus_di,
-        "minus_di": minus_di,
-    }
+        pdi = 100.0 * p2 / a
+        mdi = 100.0 * m / a
+        s = pdi + mdi
+        dx_list.append(100.0 * abs(pdi - mdi) / s if s else 0.0)
+    adx_w = _wilder(dx_list, period)
+    return {"adx": adx_w[-1] if adx_w else 0.0,
+            "plus_di": plus_di, "minus_di": minus_di}
 
 
-def _supertrend(highs: List[float], lows: List[float], closes: List[float],
-                period: int = 10, multiplier: float = 3.0) -> Dict[str, Any]:
-    """Supertrend indicator – returns current direction and value."""
-    if len(closes) < period + 1:
-        return {"direction": 0, "value": closes[-1]}
+def _supertrend(hi: List[float], lo: List[float], cl: List[float],
+                period=10, mult=3.0) -> Dict[str, Any]:
+    if len(cl) < period + 1:
+        return {"direction": 0, "value": cl[-1]}
+    hl2 = [(h + l) / 2 for h, l in zip(hi, lo)]
+    trs = [max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1]))
+           for i in range(1, len(cl))]
+    atr_s = [trs[0]] + _wilder(trs, period)
 
-    hl2 = [(h + l) / 2.0 for h, l in zip(highs, lows)]
-    atr_series: List[float] = []
-    for i in range(1, len(closes)):
-        atr_series.append(max(highs[i] - lows[i],
-                              abs(highs[i] - closes[i - 1]),
-                              abs(lows[i] - closes[i - 1])))
-    smoothed_atr = _wilder_smooth(atr_series, period)
-    # Align ATR series with closes (one shorter, shift by 1)
-    atr_aligned = [atr_series[0]] + smoothed_atr  # approximate head
-
-    upper_raw = [hl2[i] + multiplier * atr_aligned[i] for i in range(len(closes))]
-    lower_raw = [hl2[i] - multiplier * atr_aligned[i] for i in range(len(closes))]
-
-    upper = list(upper_raw)
-    lower = list(lower_raw)
-    direction = [1] * len(closes)  # 1 = bullish (below price), -1 = bearish
-
-    for i in range(1, len(closes)):
-        upper[i] = min(upper_raw[i], upper[i - 1]) if closes[i - 1] <= upper[i - 1] else upper_raw[i]
-        lower[i] = max(lower_raw[i], lower[i - 1]) if closes[i - 1] >= lower[i - 1] else lower_raw[i]
-        if direction[i - 1] == -1 and closes[i] > upper[i - 1]:
+    upper_r = [hl2[i] + mult * atr_s[i] for i in range(len(cl))]
+    lower_r = [hl2[i] - mult * atr_s[i] for i in range(len(cl))]
+    upper, lower = list(upper_r), list(lower_r)
+    direction = [1] * len(cl)
+    for i in range(1, len(cl)):
+        upper[i] = min(upper_r[i], upper[i-1]) if cl[i-1] <= upper[i-1] else upper_r[i]
+        lower[i] = max(lower_r[i], lower[i-1]) if cl[i-1] >= lower[i-1] else lower_r[i]
+        if direction[i-1] == -1 and cl[i] > upper[i-1]:
             direction[i] = 1
-        elif direction[i - 1] == 1 and closes[i] < lower[i - 1]:
+        elif direction[i-1] == 1 and cl[i] < lower[i-1]:
             direction[i] = -1
         else:
-            direction[i] = direction[i - 1]
+            direction[i] = direction[i-1]
+    val = lower[-1] if direction[-1] == 1 else upper[-1]
+    return {"direction": direction[-1], "value": val}
 
-    st_value = lower[-1] if direction[-1] == 1 else upper[-1]
-    return {"direction": direction[-1], "value": st_value}
 
-
-def _heikin_ashi_direction(candles: List[Candle]) -> int:
-    """Return +1 (bullish HA), -1 (bearish HA), 0 (mixed) over last 3 HA candles."""
+def _heikin_ashi(candles: List[Candle]) -> int:
+    """Return +1 (3 consecutive bullish HA), -1 (bearish), 0 (mixed)."""
     if len(candles) < 4:
         return 0
-    ha_open = (candles[0].open + candles[0].close) / 2.0
-    ha_opens = [ha_open]
-    ha_closes = [(c.open + c.high + c.low + c.close) / 4.0 for c in candles]
+    ha_c = [(c.open + c.high + c.low + c.close) / 4 for c in candles]
+    ha_o = [(candles[0].open + candles[0].close) / 2]
     for i in range(1, len(candles)):
-        ha_opens.append((ha_opens[-1] + ha_closes[i - 1]) / 2.0)
-    # Direction of last 3 HA candles
-    last = [(ha_closes[i] > ha_opens[i]) for i in range(-3, 0)]
-    if all(last):
-        return 1
-    if not any(last):
-        return -1
+        ha_o.append((ha_o[-1] + ha_c[i-1]) / 2)
+    bulls = [ha_c[i] > ha_o[i] for i in range(-3, 0)]
+    if all(bulls):  return 1
+    if not any(bulls): return -1
     return 0
 
 
-def _price_structure(highs: List[float], lows: List[float],
-                     window: int = 20) -> int:
-    """Return +1 for HH+HL (uptrend), -1 for LH+LL (downtrend), 0 for mixed.
-
-    Splits the window into two halves and compares swing highs/lows.
-    """
-    if len(highs) < window:
+def _price_structure(hi: List[float], lo: List[float], window=20) -> int:
+    """HH+HL → +1 (uptrend), LH+LL → -1 (downtrend), 0 mixed."""
+    if len(hi) < window:
         return 0
-    h = highs[-window:]
-    l = lows[-window:]
+    h, l = hi[-window:], lo[-window:]
     mid = window // 2
-    prev_high, curr_high = max(h[:mid]), max(h[mid:])
-    prev_low, curr_low = min(l[:mid]), min(l[mid:])
-    hh = curr_high > prev_high
-    hl = curr_low > prev_low
-    lh = curr_high < prev_high
-    ll = curr_low < prev_low
-    if hh and hl:
+    if max(h[mid:]) > max(h[:mid]) and min(l[mid:]) > min(l[:mid]):
         return 1
-    if lh and ll:
+    if max(h[mid:]) < max(h[:mid]) and min(l[mid:]) < min(l[:mid]):
         return -1
     return 0
 
 
-def _rsi_divergence(closes: List[float], rsi: List[float],
-                    lookback: int = 14) -> int:
-    """Detect RSI divergence over the last *lookback* bars.
-
-    Returns +1 for bullish divergence (price lower low, RSI higher low),
-    -1 for bearish divergence (price higher high, RSI lower high), 0 for none.
+def _rsi_divergence(cl: List[float], rsi: List[float], lb=16) -> int:
     """
-    if len(closes) < lookback + 1 or len(rsi) < lookback + 1:
+    Bullish divergence  (+1): price makes lower low, RSI makes higher low.
+    Bearish divergence  (-1): price makes higher high, RSI makes lower high.
+    Looks at the most recent price extreme within *lb* bars, then compares to
+    the current bar. Requires the extreme to be at least 5 bars ago to avoid
+    detecting the same bar.
+    """
+    if len(cl) < lb + 1 or len(rsi) < lb + 1:
         return 0
-    p = closes[-lookback:]
-    r = rsi[-lookback:]
-    # Find the extremes excluding the most recent bar
-    price_lo_idx = p[:-1].index(min(p[:-1]))
-    price_hi_idx = p[:-1].index(max(p[:-1]))
-    # Bullish: price makes a new low but RSI does not
-    if p[-1] < p[price_lo_idx] and r[-1] > r[price_lo_idx]:
-        return 1
-    # Bearish: price makes a new high but RSI does not
-    if p[-1] > p[price_hi_idx] and r[-1] < r[price_hi_idx]:
-        return -1
+    p = cl[-lb:]
+    r = rsi[-lb:]
+    # Most extreme price position (excluding last bar)
+    lo_idx = p[:-1].index(min(p[:-1]))
+    hi_idx = p[:-1].index(max(p[:-1]))
+    # Must be at least 3 bars ago to be a meaningful pivot
+    if lo_idx > lb - 4:
+        lo_idx = 0
+    if hi_idx > lb - 4:
+        hi_idx = 0
+    bullish = p[-1] < p[lo_idx] and r[-1] > r[lo_idx]
+    bearish = p[-1] > p[hi_idx] and r[-1] < r[hi_idx]
+    if bullish:  return 1
+    if bearish:  return -1
     return 0
 
 
-def _momentum(closes: List[float]) -> Dict[str, float]:
-    if len(closes) < 10:
-        return {"short": 0.0, "medium": 0.0, "agreement": 0.0}
-    base = max(abs(closes[-1]), 1e-12)
-    short = (closes[-1] - closes[-4]) / base
-    medium = (closes[-1] - closes[-10]) / base
-    agreement = 1.0 if short * medium > 0 else 0.0
-    return {"short": short, "medium": medium, "agreement": agreement}
+def _momentum(cl: List[float]) -> Dict[str, float]:
+    if len(cl) < 12:
+        return {"short": 0.0, "medium": 0.0, "agree": 0.0}
+    base = max(abs(cl[-1]), 1e-12)
+    short  = (cl[-1] - cl[-4])  / base
+    medium = (cl[-1] - cl[-12]) / base
+    return {"short": short, "medium": medium,
+            "agree": 1.0 if short * medium > 0 else 0.0}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Candle pattern detection
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Candle patterns
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _candle_patterns(candles: List[Candle]) -> List[str]:
-    """Detect multi-candle and single-candle patterns on the most recent bar."""
+def _patterns(candles: List[Candle]) -> Tuple[List[str], List[str]]:
+    """Return (bullish_patterns, bearish_patterns) for the last bar."""
     if len(candles) < 3:
-        return []
-
+        return [], []
     c0, c1, c2 = candles[-3], candles[-2], candles[-1]
-    body2 = abs(c2.close - c2.open)
-    rng2 = max(c2.high - c2.low, 1e-12)
+
+    body2  = abs(c2.close - c2.open)
+    rng2   = max(c2.high - c2.low, 1e-12)
     upper2 = c2.high - max(c2.open, c2.close)
     lower2 = min(c2.open, c2.close) - c2.low
-    body1 = c1.close - c1.open  # signed
-    body0 = c0.close - c0.open
+    b1 = c1.close - c1.open   # signed
+    b0 = c0.close - c0.open
 
-    patterns: List[str] = []
+    bull: List[str] = []
+    bear: List[str] = []
 
-    # ── Single-candle ──────────────────────────────────────────────────────
-    if body2 / rng2 <= 0.10:
-        patterns.append("Doji")
-    if lower2 >= body2 * 2.0 and upper2 <= max(body2, rng2 * 0.20):
-        patterns.append("Hammer")
-    if upper2 >= body2 * 2.0 and lower2 <= max(body2, rng2 * 0.20):
-        patterns.append("Shooting Star")
+    # ── Single-candle ────────────────────────────────────────────
+    if lower2 >= body2 * 2.0 and upper2 <= max(body2, rng2 * 0.25):
+        bull.append("Hammer")
+    if upper2 >= body2 * 2.0 and lower2 <= max(body2, rng2 * 0.25):
+        bear.append("Shooting Star")
 
-    # ── Two-candle ────────────────────────────────────────────────────────
-    if (c2.close > c2.open and body1 < 0
+    # ── Two-candle ───────────────────────────────────────────────
+    if (c2.close > c2.open and b1 < 0
             and c2.open <= c1.close and c2.close >= c1.open):
-        patterns.append("Bullish Engulfing")
-    if (c2.close < c2.open and body1 > 0
+        bull.append("Bullish Engulfing")
+    if (c2.close < c2.open and b1 > 0
             and c2.open >= c1.close and c2.close <= c1.open):
-        patterns.append("Bearish Engulfing")
+        bear.append("Bearish Engulfing")
 
-    # Tweezer Top/Bottom (same high/low within 10% of ATR)
-    atr_approx = max(c2.high - c2.low, c1.high - c1.low)
-    tol = atr_approx * 0.10
-    if (body1 > 0 and c2.close < c2.open
-            and abs(c1.high - c2.high) <= tol):
-        patterns.append("Tweezer Top")
-    if (body1 < 0 and c2.close > c2.open
-            and abs(c1.low - c2.low) <= tol):
-        patterns.append("Tweezer Bottom")
+    tol = max(c2.high - c2.low, c1.high - c1.low) * 0.12
+    if b1 > 0 and c2.close < c2.open and abs(c1.high - c2.high) <= tol:
+        bear.append("Tweezer Top")
+    if b1 < 0 and c2.close > c2.open and abs(c1.low - c2.low) <= tol:
+        bull.append("Tweezer Bottom")
 
-    # ── Three-candle ──────────────────────────────────────────────────────
-    # Morning Star: big bearish → small body → bullish closing in c0 body
-    if (body0 < 0 and abs(body1) < abs(body0) * 0.4
-            and c2.close > c2.open
-            and c2.close > (c0.open + c0.close) / 2.0):
-        patterns.append("Morning Star")
-    # Evening Star: big bullish → small body → bearish closing in c0 body
-    if (body0 > 0 and abs(body1) < abs(body0) * 0.4
-            and c2.close < c2.open
-            and c2.close < (c0.open + c0.close) / 2.0):
-        patterns.append("Evening Star")
-    # Three White Soldiers
-    if (c0.close > c0.open and c1.close > c1.open and c2.close > c2.open
+    # ── Three-candle ─────────────────────────────────────────────
+    if (b0 < 0 and abs(b1) < abs(b0) * 0.4 and c2.close > c2.open
+            and c2.close > (c0.open + c0.close) / 2):
+        bull.append("Morning Star")
+    if (b0 > 0 and abs(b1) < abs(b0) * 0.4 and c2.close < c2.open
+            and c2.close < (c0.open + c0.close) / 2):
+        bear.append("Evening Star")
+
+    if (b0 > 0 and b1 > 0 and c2.close > c2.open
             and c1.close > c0.close and c2.close > c1.close
             and c1.open > c0.open and c2.open > c1.open):
-        patterns.append("Three White Soldiers")
-    # Three Black Crows
-    if (c0.close < c0.open and c1.close < c1.open and c2.close < c2.open
+        bull.append("Three White Soldiers")
+    if (b0 < 0 and b1 < 0 and c2.close < c2.open
             and c1.close < c0.close and c2.close < c1.close
             and c1.open < c0.open and c2.open < c1.open):
-        patterns.append("Three Black Crows")
+        bear.append("Three Black Crows")
 
-    return patterns
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Walk-forward validation (kept from original, used as calibration)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _walk_forward_validation(candles: List[Candle],
-                             min_history: int = 40) -> Dict[str, Any]:
-    if len(candles) < min_history + 8:
-        return {"samples": 0, "accuracy": 0.5,
-                "call_accuracy": 0.5, "put_accuracy": 0.5, "edge": 0.0}
-    wins = calls = puts = call_wins = put_wins = 0
-    for point in range(min_history, len(candles) - 1):
-        hist = analyze_candles(candles[:point], run_validation=False)
-        if hist.direction == "WAIT":
-            continue
-        actual_up = candles[point].close > candles[point - 1].close
-        predicted_up = hist.direction == "CALL"
-        won = predicted_up == actual_up
-        wins += int(won)
-        if predicted_up:
-            calls += 1
-            call_wins += int(won)
-        else:
-            puts += 1
-            put_wins += int(won)
-    samples = calls + puts
-    acc = wins / samples if samples else 0.5
-    return {
-        "samples": samples,
-        "accuracy": round(acc, 3),
-        "call_accuracy": round(call_wins / calls if calls else 0.5, 3),
-        "put_accuracy": round(put_wins / puts if puts else 0.5, 3),
-        "edge": round(acc - 0.5, 3),
-    }
+    return bull, bear
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main analysis function
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: normalised score for one category
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cat_score(call: float, put: float) -> Tuple[int, float]:
+    """Return (direction_int, normalised_margin_score).
+    direction: +1 CALL, -1 PUT, 0 tie.
+    score: 0.50 = tie … 1.00 = total dominance.
+    """
+    total = call + put
+    if total < 1e-9:
+        return 0, 0.50
+    d = 1 if call > put else (-1 if put > call else 0)
+    score = max(call, put) / total
+    return d, score
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_candles(candles: List[Candle],
-                    run_validation: bool = True) -> SignalResult:
-    """Analyze a candle history and return a CALL / PUT / WAIT signal.
+                    run_validation: bool = False) -> SignalResult:
+    """
+    Analyse a candle history and return CALL / PUT / WAIT.
 
-    Scoring architecture
-    ────────────────────
-    Three independent categories vote:
-      TREND     – trend-following indicators (high weight)
-      OSCILLATOR – mean-reversion / momentum oscillators
-      PRICE_ACT  – candle patterns and S/R proximity
-
-    A direction is emitted only when ≥ 2 categories agree.  Within each
-    category the margin between call/put votes determines a category score
-    (0.0–1.0).  The final confidence is the weighted average of category
-    scores, optionally calibrated by walk-forward accuracy.
+    Parameters
+    ----------
+    candles         : list of Candle objects (any order; will be sorted).
+    run_validation  : kept for interface compatibility, always ignored.
     """
     if not candles:
-        raise ValueError("No candles provided for analysis")
+        raise ValueError("No candles provided")
 
-    sorted_candles = sorted(candles, key=lambda c: c.timestamp)
-    closes = [c.close for c in sorted_candles]
-    highs  = [c.high  for c in sorted_candles]
-    lows   = [c.low   for c in sorted_candles]
-    current_price = closes[-1]
+    sc = sorted(candles, key=lambda c: c.timestamp)
+    cl = [c.close for c in sc]
+    hi = [c.high  for c in sc]
+    lo = [c.low   for c in sc]
+    price = cl[-1]
 
-    if len(closes) < 30:
-        return SignalResult(
-            direction="WAIT",
-            confidence=0.5,
-            price=current_price,
-            reasons=["WAIT: chưa đủ lịch sử để phân tích"],
-            indicators={"price": current_price, "candles": len(closes)},
-        )
+    if len(cl) < 35:
+        return SignalResult("WAIT", 0.5, price,
+                            ["Chưa đủ nến để phân tích (cần ≥ 35)"],
+                            {"price": price, "candles": len(cl)})
 
-    # ── Compute all indicators ─────────────────────────────────────────────
-    ema9_series  = _ema(closes, 9)
-    ema21_series = _ema(closes, 21)
-    ema50_series = _ema(closes, 50)
-    ema9  = ema9_series[-1]  if ema9_series  else current_price
-    ema21 = ema21_series[-1] if ema21_series else current_price
-    ema50 = ema50_series[-1] if ema50_series else current_price
+    # ── Compute all indicators ────────────────────────────────────────────
+    ema9s  = _ema(cl, 9);   ema9  = ema9s[-1]
+    ema21s = _ema(cl, 21);  ema21 = ema21s[-1]
+    ema50s = _ema(cl, 50);  ema50 = ema50s[-1]
 
-    rsi_full = _rsi_series(closes, 14)
-    rsi_val  = rsi_full[-1]
-    macd_val = _macd(closes)
-    bb       = _bollinger(closes)
-    stoch    = _stochastic(highs, lows, closes)
-    willy    = _williams_r(highs, lows, closes)
-    cci_val  = _cci(highs, lows, closes)
-    atr_val  = _atr(highs, lows, closes)
-    adx      = _adx_wilder(highs, lows, closes)
-    supertr  = _supertrend(highs, lows, closes)
-    ha_dir   = _heikin_ashi_direction(sorted_candles)
-    struct   = _price_structure(highs, lows)
-    div      = _rsi_divergence(closes, rsi_full)
-    mom      = _momentum(closes)
-    patterns = _candle_patterns(sorted_candles)
+    rsi_s   = _rsi_series(cl, 14);  rsi = rsi_s[-1]
+    macd    = _macd(cl)
+    bb      = _bollinger(cl)
+    stoch   = _stochastic(hi, lo, cl)
+    willy   = _williams_r(hi, lo, cl)
+    cci_v   = _cci(hi, lo, cl)
+    atr_v   = _atr(hi, lo, cl)
+    adx_v   = _adx(hi, lo, cl)
+    st      = _supertrend(hi, lo, cl)
+    ha      = _heikin_ashi(sc)
+    struct  = _price_structure(hi, lo)
+    div     = _rsi_divergence(cl, rsi_s)
+    mom     = _momentum(cl)
+    bull_p, bear_p = _patterns(sc)
+    all_p   = bull_p + bear_p
 
-    support    = min(lows[-20:])
-    resistance = max(highs[-20:])
-    span       = max(resistance - support, 1e-12)
+    sup = min(lo[-20:])
+    res = max(hi[-20:])
+    span = max(res - sup, 1e-12)
 
-    trending = adx["adx"] >= 20
-
-    # ── Volatility filter ─────────────────────────────────────────────────
-    # ATR as percentage of price; when price barely moves, signals are noise
-    atr_pct = atr_val / max(current_price, 1e-12)
-    low_volatility = atr_pct < 0.0005   # below 0.05% per candle
+    # ── Market regime ─────────────────────────────────────────────────────
+    # ADX ≥ 25 = trending; bandwidth squeeze = potential breakout
+    trending  = adx_v["adx"] >= 25
+    very_flat = adx_v["adx"] < 15          # not worth trading
+    bw_avg    = _sma([abs(cl[i] - cl[i-1]) for i in range(1, len(cl))], 20)
+    atr_pct   = atr_v / max(price, 1e-12)
+    low_vol   = atr_pct < 0.0004            # < 0.04 % per candle
 
     # ── TREND category ────────────────────────────────────────────────────
-    t_call = t_put = 0.0
-    trend_reasons: List[str] = []
+    t_c = t_p = 0.0
+    t_rsn: List[str] = []
 
-    # EMA 9/21 crossover (weight 2.0)
+    # EMA 9/21 (2.5)
     if ema9 > ema21:
-        t_call += 2.0
-        trend_reasons.append(f"EMA9 > EMA21 (trend tăng)")
+        t_c += 2.5; t_rsn.append(f"EMA9 ({ema9:.5f}) > EMA21 ({ema21:.5f}) — trend tăng")
     else:
-        t_put += 2.0
-        trend_reasons.append(f"EMA9 < EMA21 (trend giảm)")
+        t_p += 2.5; t_rsn.append(f"EMA9 ({ema9:.5f}) < EMA21 ({ema21:.5f}) — trend giảm")
 
-    # EMA 50 long-term filter (weight 1.5)
-    if len(ema50_series) >= 50:
-        if current_price > ema50:
-            t_call += 1.5
-            trend_reasons.append("Giá trên EMA50 (xu hướng dài hạn tăng)")
+    # EMA 50 (1.5) — only meaningful when we have enough bars
+    if len(ema50s) >= 50:
+        if price > ema50:
+            t_c += 1.5; t_rsn.append(f"Giá trên EMA50 ({ema50:.5f})")
         else:
-            t_put += 1.5
-            trend_reasons.append("Giá dưới EMA50 (xu hướng dài hạn giảm)")
+            t_p += 1.5; t_rsn.append(f"Giá dưới EMA50 ({ema50:.5f})")
 
-    # MACD crossover (weight 2.0) or histogram direction (weight 1.0)
-    co = macd_val["crossover"]
-    if co == 1:
-        t_call += 2.0
-        trend_reasons.append("MACD cắt lên đường tín hiệu ✦ crossover tăng")
-    elif co == -1:
-        t_put += 2.0
-        trend_reasons.append("MACD cắt xuống đường tín hiệu ✦ crossover giảm")
+    # MACD crossover (2.5) > histogram direction (1.0)
+    if macd["crossover"] == 1:
+        t_c += 2.5; t_rsn.append("MACD crossover tăng ✦")
+    elif macd["crossover"] == -1:
+        t_p += 2.5; t_rsn.append("MACD crossover giảm ✦")
+    elif macd["histogram"] > 0:
+        t_c += 1.0; t_rsn.append(f"MACD histogram dương ({macd['histogram']:.6f})")
     else:
-        if macd_val["histogram"] > 0:
-            t_call += 1.0
-            trend_reasons.append("MACD histogram dương")
-        else:
-            t_put += 1.0
-            trend_reasons.append("MACD histogram âm")
+        t_p += 1.0; t_rsn.append(f"MACD histogram âm ({macd['histogram']:.6f})")
 
-    # Supertrend (weight 2.0)
-    if supertr["direction"] == 1:
-        t_call += 2.0
-        trend_reasons.append(f"Supertrend: bullish ({supertr['value']:.5f})")
-    elif supertr["direction"] == -1:
-        t_put += 2.0
-        trend_reasons.append(f"Supertrend: bearish ({supertr['value']:.5f})")
+    # Supertrend (2.5)
+    if st["direction"] == 1:
+        t_c += 2.5; t_rsn.append(f"Supertrend bullish (support {st['value']:.5f})")
+    elif st["direction"] == -1:
+        t_p += 2.5; t_rsn.append(f"Supertrend bearish (resistance {st['value']:.5f})")
 
-    # Heikin-Ashi (weight 1.5)
-    if ha_dir == 1:
-        t_call += 1.5
-        trend_reasons.append("Heikin-Ashi: 3 nến liên tiếp tăng")
-    elif ha_dir == -1:
-        t_put += 1.5
-        trend_reasons.append("Heikin-Ashi: 3 nến liên tiếp giảm")
+    # Heikin-Ashi (1.5)
+    if ha == 1:
+        t_c += 1.5; t_rsn.append("Heikin-Ashi: 3 nến liên tiếp tăng")
+    elif ha == -1:
+        t_p += 1.5; t_rsn.append("Heikin-Ashi: 3 nến liên tiếp giảm")
 
-    # Price structure HH/HL or LH/LL (weight 1.5)
+    # Price structure (1.5)
     if struct == 1:
-        t_call += 1.5
-        trend_reasons.append("Cấu trúc giá: HH + HL (uptrend)")
+        t_c += 1.5; t_rsn.append("Cấu trúc HH+HL (uptrend)")
     elif struct == -1:
-        t_put += 1.5
-        trend_reasons.append("Cấu trúc giá: LH + LL (downtrend)")
+        t_p += 1.5; t_rsn.append("Cấu trúc LH+LL (downtrend)")
 
-    # ADX direction (weight 1.2, only when trend is strong)
-    if adx["adx"] >= 20:
-        if adx["plus_di"] > adx["minus_di"]:
-            t_call += 1.2
-            trend_reasons.append(f"ADX {adx['adx']:.1f}: +DI > -DI (lực mua)")
+    # ADX direction (1.5) — only when trending
+    if adx_v["adx"] >= 20:
+        if adx_v["plus_di"] > adx_v["minus_di"]:
+            t_c += 1.5; t_rsn.append(f"ADX {adx_v['adx']:.1f}: +DI > -DI (lực mua)")
         else:
-            t_put += 1.2
-            trend_reasons.append(f"ADX {adx['adx']:.1f}: -DI > +DI (lực bán)")
+            t_p += 1.5; t_rsn.append(f"ADX {adx_v['adx']:.1f}: -DI > +DI (lực bán)")
 
-    # Momentum (weight 0.8)
-    if mom["agreement"]:
+    # Momentum alignment (0.8)
+    if mom["agree"]:
         if mom["short"] > 0:
-            t_call += 0.8
-        elif mom["short"] < 0:
-            t_put += 0.8
+            t_c += 0.8
+        else:
+            t_p += 0.8
 
-    t_total = t_call + t_put
-    t_direction = 1 if t_call >= t_put else -1
-    t_score = max(t_call, t_put) / t_total if t_total else 0.5
+    t_dir, t_score = _cat_score(t_c, t_p)
 
     # ── OSCILLATOR category ───────────────────────────────────────────────
-    o_call = o_put = 0.0
-    osc_reasons: List[str] = []
-    osc_w = 0.5 if trending else 1.0   # oscillators are less reliable in trends
+    o_c = o_p = 0.0
+    o_rsn: List[str] = []
+    # Oscillators are less reliable inside a strong trend
+    ow = 0.6 if trending else 1.0
 
-    # RSI with trend context
-    if rsi_val <= 30:
-        o_call += 1.5 * osc_w
-        osc_reasons.append(f"RSI {rsi_val:.1f}: vùng quá bán")
-    elif rsi_val <= 40:
-        o_call += 0.6 * osc_w
-    elif rsi_val >= 70:
-        o_put += 1.5 * osc_w
-        osc_reasons.append(f"RSI {rsi_val:.1f}: vùng quá mua")
-    elif rsi_val >= 60:
-        o_put += 0.6 * osc_w
-    else:
-        # Neutral zone: slight lean
-        if rsi_val > 52:
-            o_call += 0.2 * osc_w
-        elif rsi_val < 48:
-            o_put += 0.2 * osc_w
+    # RSI (2.0)
+    if rsi <= 28:
+        o_c += 2.0 * ow; o_rsn.append(f"RSI {rsi:.1f} — quá bán mạnh")
+    elif rsi <= 38:
+        o_c += 1.0 * ow; o_rsn.append(f"RSI {rsi:.1f} — vùng quá bán")
+    elif rsi >= 72:
+        o_p += 2.0 * ow; o_rsn.append(f"RSI {rsi:.1f} — quá mua mạnh")
+    elif rsi >= 62:
+        o_p += 1.0 * ow; o_rsn.append(f"RSI {rsi:.1f} — vùng quá mua")
+    elif rsi > 53:
+        o_c += 0.3 * ow
+    elif rsi < 47:
+        o_p += 0.3 * ow
 
-    # RSI divergence (weight 1.8 – high predictive value)
+    # RSI divergence (2.2) — high predictive value, not dampened by trend
     if div == 1:
-        o_call += 1.8
-        osc_reasons.append("RSI divergence tăng: giá thấp hơn nhưng RSI cao hơn")
+        o_c += 2.2; o_rsn.append("RSI bullish divergence — đảo chiều tăng")
     elif div == -1:
-        o_put += 1.8
-        osc_reasons.append("RSI divergence giảm: giá cao hơn nhưng RSI thấp hơn")
+        o_p += 2.2; o_rsn.append("RSI bearish divergence — đảo chiều giảm")
 
-    # Stochastic
+    # Stochastic (1.5)
     if stoch["k"] <= 20 and stoch["k"] >= stoch["d"]:
-        o_call += 1.4 * osc_w
-        osc_reasons.append(f"Stochastic {stoch['k']:.1f}: bật lên từ vùng quá bán")
+        o_c += 1.5 * ow; o_rsn.append(f"Stochastic {stoch['k']:.1f} bật lên từ quá bán")
     elif stoch["k"] >= 80 and stoch["k"] <= stoch["d"]:
-        o_put += 1.4 * osc_w
-        osc_reasons.append(f"Stochastic {stoch['k']:.1f}: quay đầu từ vùng quá mua")
-    elif stoch["k"] < 50:
-        o_put += 0.3 * osc_w
-    elif stoch["k"] > 50:
-        o_call += 0.3 * osc_w
+        o_p += 1.5 * ow; o_rsn.append(f"Stochastic {stoch['k']:.1f} quay đầu từ quá mua")
+    elif stoch["k"] < 40:
+        o_p += 0.4 * ow
+    elif stoch["k"] > 60:
+        o_c += 0.4 * ow
 
-    # Williams %R
+    # Williams %R (1.0)
     if willy <= -80:
-        o_call += 1.0 * osc_w
-        osc_reasons.append(f"Williams %R {willy:.1f}: quá bán")
+        o_c += 1.0 * ow; o_rsn.append(f"Williams %R {willy:.1f} — quá bán")
     elif willy >= -20:
-        o_put += 1.0 * osc_w
-        osc_reasons.append(f"Williams %R {willy:.1f}: quá mua")
+        o_p += 1.0 * ow; o_rsn.append(f"Williams %R {willy:.1f} — quá mua")
 
-    # CCI
-    if cci_val <= -100:
-        o_call += 1.0 * osc_w
-        osc_reasons.append(f"CCI {cci_val:.0f}: quá bán")
-    elif cci_val >= 100:
-        o_put += 1.0 * osc_w
-        osc_reasons.append(f"CCI {cci_val:.0f}: quá mua")
+    # CCI (1.0)
+    if cci_v <= -100:
+        o_c += 1.0 * ow; o_rsn.append(f"CCI {cci_v:.0f} — quá bán")
+    elif cci_v >= 100:
+        o_p += 1.0 * ow; o_rsn.append(f"CCI {cci_v:.0f} — quá mua")
 
-    o_total = o_call + o_put
-    o_direction = 1 if o_call >= o_put else -1
-    o_score = max(o_call, o_put) / o_total if o_total else 0.5
+    o_dir, o_score = _cat_score(o_c, o_p)
 
     # ── PRICE ACTION category ─────────────────────────────────────────────
-    pa_call = pa_put = 0.0
-    pa_reasons: List[str] = []
+    a_c = a_p = 0.0
+    a_rsn: List[str] = []
 
-    # Bollinger position
-    pb = bb["percent_b"]
+    # Bollinger position (1.8)
+    pb = bb["pct_b"]
     if pb <= 0.10:
-        pa_call += 1.8
-        pa_reasons.append("Bollinger: giá chạm/phá dải dưới")
-    elif pb <= 0.20:
-        pa_call += 0.8
+        a_c += 1.8; a_rsn.append("Giá chạm/phá dải Bollinger dưới")
+    elif pb <= 0.22:
+        a_c += 0.8
     elif pb >= 0.90:
-        pa_put += 1.8
-        pa_reasons.append("Bollinger: giá chạm/phá dải trên")
-    elif pb >= 0.80:
-        pa_put += 0.8
+        a_p += 1.8; a_rsn.append("Giá chạm/phá dải Bollinger trên")
+    elif pb >= 0.78:
+        a_p += 0.8
 
-    # Support / Resistance proximity
-    if current_price <= support + span * 0.10:
-        pa_call += 1.2
-        pa_reasons.append("Giá gần vùng hỗ trợ 20 nến")
-    elif current_price >= resistance - span * 0.10:
-        pa_put += 1.2
-        pa_reasons.append("Giá gần vùng kháng cự 20 nến")
+    # S/R proximity (1.2)
+    if price <= sup + span * 0.10:
+        a_c += 1.2; a_rsn.append(f"Giá gần vùng hỗ trợ ({sup:.5f})")
+    elif price >= res - span * 0.10:
+        a_p += 1.2; a_rsn.append(f"Giá gần vùng kháng cự ({res:.5f})")
 
     # Candle patterns
-    CALL_PATTERNS = {"Hammer", "Bullish Engulfing", "Morning Star",
-                     "Three White Soldiers", "Tweezer Bottom"}
-    PUT_PATTERNS  = {"Shooting Star", "Bearish Engulfing", "Evening Star",
-                     "Three Black Crows", "Tweezer Top"}
-    STRONG_PATTERNS = {"Three White Soldiers", "Three Black Crows",
-                       "Morning Star", "Evening Star",
-                       "Bullish Engulfing", "Bearish Engulfing"}
+    STRONG = {"Three White Soldiers", "Three Black Crows",
+              "Morning Star", "Evening Star",
+              "Bullish Engulfing", "Bearish Engulfing"}
+    for pat in bull_p:
+        w = 1.8 if pat in STRONG else 1.0
+        a_c += w; a_rsn.append(f"Mẫu nến tăng: {pat}")
+    for pat in bear_p:
+        w = 1.8 if pat in STRONG else 1.0
+        a_p += w; a_rsn.append(f"Mẫu nến giảm: {pat}")
 
-    for pat in patterns:
-        if pat in CALL_PATTERNS:
-            w = 1.8 if pat in STRONG_PATTERNS else 1.0
-            pa_call += w
-            pa_reasons.append(f"Mẫu nến CALL: {pat}")
-        elif pat in PUT_PATTERNS:
-            w = 1.8 if pat in STRONG_PATTERNS else 1.0
-            pa_put += w
-            pa_reasons.append(f"Mẫu nến PUT: {pat}")
-        elif pat == "Doji":
-            pa_reasons.append("Doji: thị trường lưỡng lự")
+    # Last-candle body strength (0.4)
+    last = sc[-1]
+    body = last.close - last.open
+    rng  = max(last.high - last.low, 1e-12)
+    if abs(body) / rng >= 0.60:
+        if body > 0:
+            a_c += 0.4
+        else:
+            a_p += 0.4
 
-    # Body strength of the last candle as a weak signal
-    if len(sorted_candles) >= 2:
-        last = sorted_candles[-1]
-        body = last.close - last.open
-        rng = max(last.high - last.low, 1e-12)
-        if abs(body) / rng >= 0.60:
-            if body > 0:
-                pa_call += 0.4
-            else:
-                pa_put += 0.4
+    a_dir, a_score = _cat_score(a_c, a_p)
 
-    pa_total = pa_call + pa_put
-    pa_direction = 1 if pa_call >= pa_put else -1
-    pa_score = max(pa_call, pa_put) / pa_total if pa_total else 0.5
-
-    # ── Categorical confluence ────────────────────────────────────────────
-    dirs = [t_direction, o_direction, pa_direction]
+    # ── Confluence: require ≥ 2 of 3 categories agree ────────────────────
+    dirs  = [t_dir, o_dir, a_dir]
     call_votes = sum(1 for d in dirs if d == 1)
     put_votes  = sum(1 for d in dirs if d == -1)
 
-    # Must win at least 2 of 3 categories
     if call_votes >= 2:
         direction = "CALL"
     elif put_votes >= 2:
@@ -747,118 +590,125 @@ def analyze_candles(candles: List[Candle],
     else:
         direction = "WAIT"
 
-    # Weighted confidence (TREND carries most weight)
-    weights = (2.5, 1.5, 1.0)   # trend, oscillator, price_action
-    scores = (t_score, o_score, pa_score)
-    raw_confidence = sum(w * s for w, s in zip(weights, scores)) / sum(weights)
-    confidence = min(0.95, max(0.50, raw_confidence))
+    # ── Regime-aware weighted confidence ─────────────────────────────────
+    if trending:
+        # trend-following mode: trust TREND most
+        weights = (0.55, 0.25, 0.20)
+    else:
+        # mean-reversion mode: trust OSCILLATOR most
+        weights = (0.20, 0.50, 0.30)
 
-    # Low-volatility penalty
-    if low_volatility:
-        confidence = max(0.50, confidence - 0.06)
+    cat_scores = (t_score, o_score, a_score)
+    # For the winning direction we want the score of categories that agree
+    if direction == "CALL":
+        aligned = [s for d, s in zip(dirs, cat_scores) if d == 1]
+        opposed = [s for d, s in zip(dirs, cat_scores) if d == -1]
+    elif direction == "PUT":
+        aligned = [s for d, s in zip(dirs, cat_scores) if d == -1]
+        opposed = [s for d, s in zip(dirs, cat_scores) if d == 1]
+    else:
+        aligned, opposed = [], []
 
-    # ── Walk-forward calibration ───────────────────────────────────────────
-    validation = (
-        _walk_forward_validation(sorted_candles)
-        if run_validation
-        else {"samples": 0, "accuracy": 0.5,
-              "call_accuracy": 0.5, "put_accuracy": 0.5, "edge": 0.0}
-    )
-    if validation["samples"] >= 12 and direction != "WAIT":
-        hist_acc = validation[
-            "call_accuracy" if direction == "CALL" else "put_accuracy"
-        ]
-        opp_acc = validation[
-            "put_accuracy" if direction == "CALL" else "call_accuracy"
-        ]
-        # Blend indicator confidence with historical accuracy (35% weight)
-        confidence = confidence * 0.65 + hist_acc * 0.35
-        # Flip only when historical evidence strongly contradicts indicators
-        if confidence < 0.54 and opp_acc - hist_acc >= 0.10:
-            direction = "PUT" if direction == "CALL" else "CALL"
-            confidence = opp_acc
+    if aligned:
+        raw_conf = sum(weights[i] * cat_scores[i]
+                       for i in range(3)
+                       if dirs[i] == (1 if direction == "CALL" else -1))
+        norm_w   = sum(weights[i] for i in range(3)
+                       if dirs[i] == (1 if direction == "CALL" else -1))
+        raw_conf = raw_conf / norm_w if norm_w else 0.5
+    else:
+        raw_conf = 0.5
 
-    # Minimum edge threshold
-    if direction != "WAIT" and confidence < 0.54:
+    # Penalty: every flat-market indicator reduces confidence
+    if very_flat:
+        raw_conf -= 0.10
+    if low_vol:
+        raw_conf -= 0.05
+
+    confidence = round(min(0.95, max(0.50, raw_conf)), 2)
+
+    # Raise confidence bar: only emit strong signals
+    MIN_CONF = 0.62
+    if direction != "WAIT" and confidence < MIN_CONF:
         direction = "WAIT"
 
-    confidence = round(confidence, 2)
-
-    # ── Compile reasons ───────────────────────────────────────────────────
-    all_reasons: List[str] = []
-    # Only include reasons from the winning side to keep the message clean
+    # ── Build reason list ─────────────────────────────────────────────────
+    reasons: List[str] = []
     if direction == "CALL":
-        all_reasons += [r for r in trend_reasons if "tăng" in r or "bullish" in r.lower() or "buy" in r.lower() or "+" in r or "trên" in r or "hỗ trợ" in r]
-        all_reasons += [r for r in osc_reasons if "bán" in r or "tăng" in r or "divergence tăng" in r]
-        all_reasons += pa_reasons[:3]
+        reasons += [r for r in t_rsn  if "tăng" in r or "bullish" in r.lower() or "dương" in r or "trên" in r or "mua" in r or "✦" in r]
+        reasons += [r for r in o_rsn  if "bán"  in r or "tăng" in r or "divergence" in r.lower()]
+        reasons += a_rsn[:4]
     elif direction == "PUT":
-        all_reasons += [r for r in trend_reasons if "giảm" in r or "bearish" in r.lower() or "dưới" in r or "kháng cự" in r]
-        all_reasons += [r for r in osc_reasons if "mua" in r or "giảm" in r or "divergence giảm" in r]
-        all_reasons += pa_reasons[:3]
+        reasons += [r for r in t_rsn  if "giảm" in r or "bearish" in r.lower() or "âm" in r or "dưới" in r or "bán" in r or "✦" in r]
+        reasons += [r for r in o_rsn  if "mua"  in r or "giảm" in r or "divergence" in r.lower()]
+        reasons += a_rsn[:4]
     else:
-        all_reasons.append("WAIT: tín hiệu từ các nhóm chỉ báo chưa thống nhất")
-        all_reasons += trend_reasons[:2]
+        reasons.append("Tín hiệu từ các nhóm chỉ báo chưa đủ thống nhất — không vào lệnh")
+        # Show what's happening in each category
+        if t_dir == 1:   reasons.append(f"Trend: CALL ({t_score*100:.0f}%)")
+        elif t_dir == -1: reasons.append(f"Trend: PUT ({t_score*100:.0f}%)")
+        if o_dir == 1:   reasons.append(f"Oscillator: CALL ({o_score*100:.0f}%)")
+        elif o_dir == -1: reasons.append(f"Oscillator: PUT ({o_score*100:.0f}%)")
+        if a_dir == 1:   reasons.append(f"Price Action: CALL ({a_score*100:.0f}%)")
+        elif a_dir == -1: reasons.append(f"Price Action: PUT ({a_score*100:.0f}%)")
 
-    if validation["samples"] >= 12:
-        all_reasons.append(
-            f"Backtest {validation['samples']} mẫu: "
-            f"{validation['accuracy'] * 100:.0f}% chính xác"
-        )
-    if low_volatility:
-        all_reasons.append("Biến động thấp – giảm độ tin cậy")
+    if not reasons:
+        reasons = [f"Phân tích hoàn tất ({direction})"]
+
+    if low_vol:
+        reasons.append("⚠️ Biến động thấp — giảm độ tin cậy")
+    if very_flat:
+        reasons.append("⚠️ ADX thấp — thị trường sideway")
 
     return SignalResult(
         direction=direction,
         confidence=confidence,
-        price=current_price,
-        reasons=all_reasons or ["Phân tích hoàn tất"],
+        price=price,
+        reasons=reasons,
         indicators={
-            "price": current_price,
-            "ema9": ema9, "ema21": ema21, "ema50": ema50,
-            "rsi": rsi_val,
-            "macd": macd_val,
-            "bollinger": bb,
-            "stochastic": stoch,
-            "williams_r": willy,
-            "cci": cci_val,
-            "adx": adx,
-            "atr": atr_val,
-            "atr_pct": round(atr_pct * 100, 4),
-            "supertrend": supertr,
-            "ha_direction": ha_dir,
+            "price":          price,
+            "ema9":           ema9,
+            "ema21":          ema21,
+            "ema50":          ema50,
+            "rsi":            rsi,
+            "macd":           macd,
+            "bollinger":      bb,
+            "stochastic":     stoch,
+            "williams_r":     willy,
+            "cci":            cci_v,
+            "adx":            adx_v,
+            "atr":            atr_v,
+            "atr_pct":        round(atr_pct * 100, 4),
+            "supertrend":     st,
+            "ha_direction":   ha,
             "price_structure": struct,
             "rsi_divergence": div,
-            "momentum": mom,
-            "support": support,
-            "resistance": resistance,
-            "patterns": patterns,
-            "t_call": round(t_call, 2), "t_put": round(t_put, 2),
-            "o_call": round(o_call, 2), "o_put": round(o_put, 2),
-            "pa_call": round(pa_call, 2), "pa_put": round(pa_put, 2),
-            "category_votes": {"call": call_votes, "put": put_votes},
-            "candles": len(closes),
-            "walk_forward": validation,
+            "momentum":       mom,
+            "support":        sup,
+            "resistance":     res,
+            "patterns":       {"bull": bull_p, "bear": bear_p},
+            "regime":         "trending" if trending else ("flat" if very_flat else "ranging"),
+            "t_call":  round(t_c, 2), "t_put":  round(t_p, 2),
+            "o_call":  round(o_c, 2), "o_put":  round(o_p, 2),
+            "a_call":  round(a_c, 2), "a_put":  round(a_p, 2),
+            "votes":          {"call": call_votes, "put": put_votes},
+            "candles":        len(cl),
+            "walk_forward":   {"samples": 0, "accuracy": 0.5,
+                               "call_accuracy": 0.5, "put_accuracy": 0.5,
+                               "edge": 0.0},   # stub – kept for UI compatibility
         },
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Signal evaluation (unchanged interface)
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_signal(signal: SignalResult, current_price: float) -> Dict[str, Any]:
-    """Compare exit price against entry price to determine win/loss."""
-    if signal.direction == "CALL":
-        won = current_price > signal.price
-    else:
-        won = current_price < signal.price
+    won  = current_price > signal.price if signal.direction == "CALL" \
+           else current_price < signal.price
     diff = current_price - signal.price
-    pct  = (diff / signal.price) * 100 if signal.price else 0.0
-    return {
-        "won": won,
-        "direction": signal.direction,
-        "entry_price": signal.price,
-        "exit_price": current_price,
-        "diff": diff,
-        "diff_pct": pct,
-    }
+    pct  = (diff / signal.price * 100) if signal.price else 0.0
+    return {"won": won, "direction": signal.direction,
+            "entry_price": signal.price, "exit_price": current_price,
+            "diff": diff, "diff_pct": pct}
