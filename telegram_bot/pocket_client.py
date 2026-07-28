@@ -2,7 +2,6 @@
 import asyncio
 import json
 import re
-import time
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -510,14 +509,16 @@ class BotPocketClient:
         Including it makes the analysis depend on a partial candle, while the
         result is later judged at a completed expiry.  Keep both sides aligned.
         """
-        candles = await self.get_candles(asset, timeframe, count=count + 1)
-        now = time.time()
-        completed = [
-            candle
-            for candle in candles
-            if self._candle_timestamp(candle) + timeframe <= now + 1.0
-        ]
-        return sorted(completed, key=self._candle_timestamp)[-count:]
+        candles = sorted(
+            await self.get_candles(asset, timeframe, count=count + 1),
+            key=self._candle_timestamp,
+        )
+        if len(candles) <= 1:
+            return []
+        # PocketOption returns the currently forming candle as the newest
+        # element. Do not compare its timestamp to the local clock: broker
+        # timestamps may be offset from the Replit host clock.
+        return candles[:-1][-count:]
 
     async def get_latest_price(self, asset: str, timeframe: int = 60) -> float:
         """Return the latest close price by fetching a few recent candles."""
@@ -556,7 +557,7 @@ class BotPocketClient:
         candidates = [
             (abs((stamp + timeframe) - expiry), candle)
             for stamp, candle in normalized
-            if expiry - tolerance <= stamp + timeframe <= expiry + tolerance
+            if stamp + timeframe <= expiry + tolerance
         ]
         if not candidates:
             return None
