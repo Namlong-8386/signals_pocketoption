@@ -306,11 +306,14 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # do not share the same stale candle close. Wait briefly for the
         # stream to deliver a tick after subscribing via changeSymbol.
         current_price = await pocket_client.get_current_price_with_timeout(asset, timeout=2.0)
-        if current_price is not None:
-            signal.price = current_price
-            logger.info(f"Using live price for {asset}: {current_price}")
-        else:
-            logger.warning(f"No live price available for {asset}, using candle close: {signal.price}")
+        entry_tick = pocket_client.get_current_tick(asset)
+        if current_price is None or entry_tick is None:
+            raise RuntimeError(
+                f"Không có giá live hợp lệ cho {asset}; "
+                "không thể tạo tín hiệu chính xác."
+            )
+        signal.price = current_price
+        logger.info(f"Using live price for {asset}: {current_price}")
 
         entry_time = datetime.now()
         user_id = update.effective_user.id
@@ -321,6 +324,7 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "timeframe": timeframe_label,
             "timeframe_seconds": timeframe_seconds,
             "signal": signal,
+            "entry_tick": entry_tick,
             "entry_time": entry_time,
             "message_id": query.message.message_id,
             "chat_id": query.message.chat_id,
@@ -409,12 +413,30 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
 
         # Prefer the live tick price for the exit; fall back to fetching the
         # latest candle close if the stream hasn't provided a price yet.
-        exit_price = await pocket_client.get_current_price_with_timeout(asset, timeout=2.0)
+        entry_tick = signal_data.get("entry_tick")
+        entry_tick_timestamp = entry_tick[1] if entry_tick else None
+        exit_price = await pocket_client.get_current_price_with_timeout(
+            asset,
+            timeout=3.0,
+            min_timestamp=entry_tick_timestamp,
+        )
         if exit_price is None:
-            exit_price = await pocket_client.get_latest_price(asset, signal_data["timeframe_seconds"])
-            logger.info(f"Result for {asset}: no live price, using candle close {exit_price}")
-        else:
-            logger.info(f"Result for {asset}: using live price {exit_price}")
+            logger.warning(
+                f"Result for {asset}: no fresh tick after entry; "
+                "will not classify the signal"
+            )
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ Không đủ dữ liệu giá mới cho {asset} sau {tf_key}. "
+                    "Bot không thể xác định WIN/LOSS chính xác."
+                ),
+            )
+            return
+        logger.info(
+            f"Result for {asset}: using fresh live price {exit_price} "
+            f"(entry_tick={entry_tick_timestamp})"
+        )
 
         logger.info(
             f"Evaluating {asset}: direction={signal.direction}, "

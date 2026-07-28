@@ -1,0 +1,1 @@
+- [Live price validation](live-price-validation.md) — Result checks must use a newer broker-timestamped tick, never a cached entry tick or candle fallback.

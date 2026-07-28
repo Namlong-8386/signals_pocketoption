@@ -102,7 +102,7 @@ class BotPocketClient:
         self._connected = False
         self._connection_lock = asyncio.Lock()
         self._candle_request_lock = asyncio.Lock()
-        self._latest_prices: Dict[str, float] = {}
+        self._latest_prices: Dict[str, tuple[float, float]] = {}
 
     @staticmethod
     def _format_ssid(raw: str) -> str:
@@ -320,7 +320,7 @@ class BotPocketClient:
                             symbol = candle.get("asset")
                             price = candle.get("close")
                             if symbol is not None and price is not None:
-                                self._latest_prices[str(symbol)] = float(price)
+                                self._latest_prices[str(symbol)] = (float(price), datetime.now().timestamp())
         except Exception as e:
             logger.debug(f"Stream update parse error: {e}")
 
@@ -351,7 +351,7 @@ class BotPocketClient:
                     if isinstance(item, (list, tuple)) and len(item) >= 3:
                         symbol = str(item[0])
                         price = float(item[-1])
-                        self._latest_prices[symbol] = price
+                        self._latest_prices[symbol] = (price, float(item[1]))
                         # Do not log every tick: the broker can emit hundreds
                         # of updates during startup and drown out bot errors.
         except Exception as e:
@@ -359,21 +359,29 @@ class BotPocketClient:
 
     def get_current_price(self, asset: str) -> Optional[float]:
         """Return the latest live tick price for an asset, if available."""
+        tick = self._latest_prices.get(asset)
+        return tick[0] if tick else None
+
+    def get_current_tick(self, asset: str) -> Optional[tuple[float, float]]:
+        """Return the latest live tick as ``(price, broker_timestamp)``."""
         return self._latest_prices.get(asset)
 
     async def get_current_price_with_timeout(
-        self, asset: str, timeout: float = 2.0
+        self,
+        asset: str,
+        timeout: float = 2.0,
+        min_timestamp: Optional[float] = None,
     ) -> Optional[float]:
-        """Return the latest live tick price, waiting up to `timeout` seconds
-        for the stream to deliver the first tick after subscribing to the asset.
-        """
-        if asset in self._latest_prices:
-            return self._latest_prices[asset]
+        """Return a live price, optionally requiring a newer broker tick."""
+        tick = self._latest_prices.get(asset)
+        if tick and (min_timestamp is None or tick[1] > min_timestamp):
+            return tick[0]
 
         deadline = datetime.now().timestamp() + timeout
         while datetime.now().timestamp() < deadline:
-            if asset in self._latest_prices:
-                return self._latest_prices[asset]
+            tick = self._latest_prices.get(asset)
+            if tick and (min_timestamp is None or tick[1] > min_timestamp):
+                return tick[0]
             await asyncio.sleep(0.1)
         return None
 
