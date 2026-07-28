@@ -501,6 +501,44 @@ class BotPocketClient:
             raise RuntimeError(f"Không lấy được giá cho {asset}")
         return float(candles[-1].close)
 
+    async def get_expiry_candle(
+        self,
+        asset: str,
+        timeframe: int,
+        entry_timestamp: float,
+        tolerance: float = 3.0,
+    ) -> Optional[Candle]:
+        """Return the candle closing at the signal expiry.
+
+        Result classification must use a completed candle, not an arbitrary
+        tick observed after ``sleep(timeframe)``.  Candle timestamps from the
+        broker identify the candle open, so choose the first candle whose open
+        is at or after the expiry boundary and require it to be closed.
+        """
+        candles = await self.get_candles(
+            asset, timeframe, count=max(5, RESULT_CANDLE_COUNT)
+        )
+        if not candles:
+            return None
+
+        expiry = float(entry_timestamp) + float(timeframe)
+        normalized = []
+        for candle in candles:
+            stamp = candle.timestamp.timestamp() if hasattr(candle.timestamp, "timestamp") else float(candle.timestamp)
+            normalized.append((stamp, candle))
+        normalized.sort(key=lambda item: item[0])
+
+        # Prefer the candle ending closest to the expiry boundary. Broker
+        # timestamps can be a few seconds off, hence the small tolerance.
+        candidates = [
+            (abs((stamp + timeframe) - expiry), candle)
+            for stamp, candle in normalized
+            if stamp + timeframe <= expiry + tolerance
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item[0])[1]
+
     async def close(self) -> None:
         if self._client:
             await self._client.disconnect()

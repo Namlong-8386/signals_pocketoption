@@ -448,31 +448,48 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
     try:
         await pocket_client.ensure_connected()
 
-        # Prefer the live tick price for the exit; fall back to fetching the
-        # latest candle close if the stream hasn't provided a price yet.
         entry_tick = signal_data.get("entry_tick")
         entry_tick_timestamp = entry_tick[1] if entry_tick else None
-        exit_price = await pocket_client.get_current_price_with_timeout(
-            asset,
-            timeout=3.0,
-            min_timestamp=entry_tick_timestamp,
-        )
-        if exit_price is None:
+        if entry_tick_timestamp is None:
             logger.warning(
-                f"Result for {asset}: no fresh tick after entry; "
+                f"Result for {asset}: missing broker entry timestamp; "
                 "will not classify the signal"
             )
             await application.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"⚠️ Không đủ dữ liệu giá mới cho {asset} sau {tf_key}. "
+                    f"⚠️ Thiếu mốc thời gian vào lệnh cho {asset} sau {tf_key}. "
                     "Bot không thể xác định WIN/LOSS chính xác."
                 ),
             )
             return
+        expiry_candle = await pocket_client.get_expiry_candle(
+            asset,
+            signal_data["timeframe_seconds"],
+            entry_tick_timestamp,
+        )
+        if expiry_candle is None:
+            logger.warning(
+                f"Result for {asset}: no completed expiry candle found "
+                f"(entry_tick={entry_tick_timestamp})"
+            )
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ Chưa có nến đóng đúng thời điểm hết hạn cho {asset}. "
+                    "Bot không chấm WIN/LOSS để tránh kết luận sai."
+                ),
+            )
+            return
+        exit_price = float(expiry_candle.close)
+        expiry_stamp = (
+            expiry_candle.timestamp.timestamp()
+            if hasattr(expiry_candle.timestamp, "timestamp")
+            else float(expiry_candle.timestamp)
+        )
         logger.info(
-            f"Result for {asset}: using fresh live price {exit_price} "
-            f"(entry_tick={entry_tick_timestamp})"
+            f"Result for {asset}: using completed candle close {exit_price} "
+            f"(candle_timestamp={expiry_stamp}, entry_tick={entry_tick_timestamp})"
         )
 
         logger.info(
