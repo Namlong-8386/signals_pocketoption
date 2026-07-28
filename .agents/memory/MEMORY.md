@@ -1,0 +1,1 @@
+- [Signal analysis policy](signal-analysis-policy.md) — use walk-forward validation and trend-aware indicator weighting; do not force signals in flat markets.

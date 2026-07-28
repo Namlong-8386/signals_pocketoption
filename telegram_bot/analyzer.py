@@ -161,6 +161,21 @@ def _adx(highs: List[float], lows: List[float], closes: List[float], period: int
     return {"adx": adx, "plus_di": plus, "minus_di": minus}
 
 
+def _momentum(closes: List[float]) -> Dict[str, float]:
+    """Return normalized momentum over several horizons.
+
+    Combining short and medium horizons avoids treating one candle as the whole
+    market trend while still reacting quickly enough for the selected timeframe.
+    """
+    if len(closes) < 10:
+        return {"short": 0.0, "medium": 0.0, "agreement": 0.0}
+    base = max(abs(closes[-1]), 1e-12)
+    short = (closes[-1] - closes[-4]) / base
+    medium = (closes[-1] - closes[-10]) / base
+    agreement = 1.0 if short * medium > 0 else 0.0
+    return {"short": short, "medium": medium, "agreement": agreement}
+
+
 def _walk_forward_validation(
     candles: List[Candle], min_history: int = 40
 ) -> Dict[str, Any]:
@@ -238,6 +253,7 @@ def analyze_candles(
     cci_val = _cci(highs, lows, closes)
     atr_val = _atr(highs, lows, closes)
     adx = _adx(highs, lows, closes)
+    momentum = _momentum(closes)
     ema9_current = ema9[-1] if ema9 else current_price
     ema21_current = ema21[-1] if ema21 else current_price
     last_5 = closes[-5:]
@@ -268,42 +284,69 @@ def analyze_candles(
             put_score += 1.2
             reasons.append(f"ADX {adx['adx']:.1f}: lực bán chiếm ưu thế")
 
+    # RSI is directional only at meaningful extremes. In a strong trend,
+    # overbought/oversold is usually momentum rather than an immediate reversal,
+    # so do not let RSI generate a counter-trend vote.
+    trending = adx["adx"] >= 25
+    if rsi_val <= 35:
+        if trending and ema9_current < ema21_current:
+            put_score += 0.7
+            reasons.append(f"RSI {rsi_val:.1f}: động lượng giảm trong trend mạnh")
+        elif not trending:
+            call_score += 1.2
+            reasons.append(f"RSI {rsi_val:.1f}: vùng quá bán")
+    elif rsi_val >= 65:
+        if trending and ema9_current > ema21_current:
+            call_score += 0.7
+            reasons.append(f"RSI {rsi_val:.1f}: động lượng tăng trong trend mạnh")
+        elif not trending:
+            put_score += 1.2
+            reasons.append(f"RSI {rsi_val:.1f}: vùng quá mua")
+    elif rsi_val > 52:
+        call_score += 0.3
+    elif rsi_val < 48:
+        put_score += 0.3
+
+    # Multi-horizon momentum confirms a trend only when short and medium
+    # horizons point in the same direction.
+    if momentum["agreement"]:
+        if momentum["short"] > 0:
+            call_score += 0.8
+            reasons.append("Động lượng ngắn và trung hạn cùng tăng")
+        elif momentum["short"] < 0:
+            put_score += 0.8
+            reasons.append("Động lượng ngắn và trung hạn cùng giảm")
+
     # Channel strategy: reward only entries near Bollinger edges.
     width = max(bb["upper"] - bb["lower"], 1e-12)
     position = (current_price - bb["lower"]) / width
-    if position <= 0.15:
+    if position <= 0.15 and not (trending and ema9_current < ema21_current):
         call_score += 1.8
         reasons.append("Bollinger: giá sát dải dưới")
-    elif position >= 0.85:
+    elif position >= 0.85 and not (trending and ema9_current > ema21_current):
         put_score += 1.8
         reasons.append("Bollinger: giá sát dải trên")
-    if rsi_val <= 30:
-        call_score += 1.5
-        reasons.append(f"RSI {rsi_val:.1f}: quá bán")
-    elif rsi_val >= 70:
-        put_score += 1.5
-        reasons.append(f"RSI {rsi_val:.1f}: quá mua")
-
     # Oscillator strategy: Stochastic and CCI.
+    oscillator_weight = 0.65 if trending else 1.0
     if stochastic["k"] <= 20 and stochastic["k"] >= stochastic["d"]:
-        call_score += 1.4
+        call_score += 1.4 * oscillator_weight
         reasons.append(f"Stochastic {stochastic['k']:.1f}: bật lên")
     elif stochastic["k"] >= 80 and stochastic["k"] <= stochastic["d"]:
-        put_score += 1.4
+        put_score += 1.4 * oscillator_weight
         reasons.append(f"Stochastic {stochastic['k']:.1f}: quay đầu")
     if cci_val <= -100:
-        call_score += 1.0
+        call_score += 1.0 * oscillator_weight
         reasons.append(f"CCI {cci_val:.0f}: quá bán")
     elif cci_val >= 100:
-        put_score += 1.0
+        put_score += 1.0 * oscillator_weight
         reasons.append(f"CCI {cci_val:.0f}: quá mua")
 
     # Williams %R confirms the oscillator reversal zone.
     if williams <= -80:
-        call_score += 1.0
+        call_score += 1.0 * oscillator_weight
         reasons.append(f"Williams %R {williams:.1f}: quá bán")
     elif williams >= -20:
-        put_score += 1.0
+        put_score += 1.0 * oscillator_weight
         reasons.append(f"Williams %R {williams:.1f}: quá mua")
 
     # Candle confirmation: engulfing, rejection wick, then strong body.
@@ -353,7 +396,13 @@ def analyze_candles(
     total = call_score + put_score
     direction = "CALL" if call_score > put_score else "PUT"
     winning_score = max(call_score, put_score)
-    confidence = min(0.95, max(0.5, winning_score / total if total else 0.5))
+    losing_score = min(call_score, put_score)
+    # Margin is more meaningful than winner/total when several indicators are
+    # neutral. Keep confidence bounded so it remains a calibrated score.
+    confidence = min(
+        0.95,
+        max(0.5, 0.5 + (winning_score - losing_score) / max(total, 1.0)),
+    )
 
     validation = (
         _walk_forward_validation(sorted_candles)
@@ -409,6 +458,7 @@ def analyze_candles(
             "cci": cci_val,
             "adx": adx,
             "atr": atr_val,
+            "momentum": momentum,
             "support": support,
             "resistance": resistance,
             "call_score": round(call_score, 2),
