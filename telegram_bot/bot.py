@@ -4,7 +4,7 @@ import logging
 from typing import Dict, Any
 from datetime import datetime
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -26,6 +26,46 @@ active_signals: Dict[int, Dict[str, Any]] = {}
 
 # Shared PocketOption client
 pocket_client = BotPocketClient()
+
+START_IMAGE = "https://i.ibb.co/gMz28z9K/uploaded-image.jpg"
+ASSET_IMAGE = "https://i.ibb.co/3m4mJbqW/uploaded-image.jpg"
+TIMEFRAME_IMAGE = "https://i.ibb.co/8gspvnSH/uploaded-image.jpg"
+CALL_IMAGE = "https://i.ibb.co/0RqnRvmn/uploaded-image.jpg"
+PUT_IMAGE = "https://i.ibb.co/hxNhCwc5/uploaded-image.jpg"
+
+
+async def _show_photo_message(
+    query, image_url: str, caption: str, reply_markup: InlineKeyboardMarkup
+) -> None:
+    """Replace a callback message with a photo while preserving its buttons."""
+    media = InputMediaPhoto(
+        media=image_url,
+        caption=caption,
+        parse_mode="Markdown",
+    )
+    try:
+        await query.edit_message_media(media=media, reply_markup=reply_markup)
+    except Exception:
+        # A text message cannot be converted to media in place. Replace it so
+        # the first transition after /start also gets the requested image.
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.message.reply_photo(
+            photo=image_url,
+            caption=caption,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+
+
+async def _show_caption_message(query, text: str) -> None:
+    """Update the caption while the current callback message is a photo."""
+    try:
+        await query.edit_message_caption(caption=text, parse_mode="Markdown")
+    except Exception:
+        await query.edit_message_text(text, parse_mode="Markdown")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -63,9 +103,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await update.message.reply_photo(
+            photo=START_IMAGE,
+            caption=text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
     elif update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await _show_photo_message(update.callback_query, START_IMAGE, text, reply_markup)
     return CHOOSING_MARKET
 
 
@@ -79,8 +124,6 @@ async def _show_asset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     page = context.user_data.get("page", 0)
     if not category:
         return await start(update, context)
-
-    await query.edit_message_text("⏳ Đang kết nối và lấy danh sách cặp tiền từ API...")
 
     try:
         await pocket_client.ensure_connected()
@@ -130,12 +173,13 @@ async def _show_asset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         rows.append([InlineKeyboardButton("🔙 Quay lại", callback_data="back_market")])
 
-        await query.edit_message_text(
+        await _show_photo_message(
+            query,
+            ASSET_IMAGE,
             f"{title}\n\n"
             f"Tìm thấy *{len(symbols)}* cặp. Trang *{page + 1}/{total_pages}*.\n"
             f"Chọn một cặp để phân tích:",
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode="Markdown",
+            InlineKeyboardMarkup(rows),
         )
         return CHOOSING_ASSET
 
@@ -196,10 +240,11 @@ async def asset_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         [InlineKeyboardButton("15 phút", callback_data="tf_15m")],
         [InlineKeyboardButton("🔙 Quay lại", callback_data="back_asset")],
     ]
-    await query.edit_message_text(
+    await _show_photo_message(
+        query,
+        TIMEFRAME_IMAGE,
         f"📊 *{asset}*\n\nChọn khung thời gian tín hiệu:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
+        InlineKeyboardMarkup(keyboard),
     )
     return CHOOSING_TIMEFRAME
 
@@ -216,10 +261,7 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
     timeframe_seconds = TIMEFRAMES[tf_key]
     asset = context.user_data["asset"]
 
-    await query.edit_message_text(
-        f"⏳ Đang phân tích *{asset}* khung *{tf_key}*...",
-        parse_mode="Markdown",
-    )
+    await _show_caption_message(query, f"⏳ Đang phân tích *{asset}* khung *{tf_key}*...")
 
     try:
         await pocket_client.ensure_connected()
@@ -267,7 +309,13 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
             [InlineKeyboardButton("🔔 Nhận tín hiệu mới", callback_data="new_signal")],
             [InlineKeyboardButton("🏠 Menu chính", callback_data="back_market")],
         ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        signal_image = CALL_IMAGE if signal.direction == "CALL" else PUT_IMAGE
+        await _show_photo_message(
+            query,
+            signal_image,
+            text,
+            InlineKeyboardMarkup(keyboard),
+        )
 
         # Schedule result update. Pass a snapshot of the signal data so the
         # update task is independent from any future signals the user requests.
