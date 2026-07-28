@@ -472,33 +472,30 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
                 ),
             )
             return
-        expiry_candle = await pocket_client.get_expiry_candle(
+        expiry_timestamp = entry_tick_timestamp + signal_data["timeframe_seconds"]
+        exit_tick = await pocket_client.get_stream_price_at_or_after(
             asset,
-            signal_data["timeframe_seconds"],
-            entry_tick_timestamp,
+            expiry_timestamp,
+            timeout=10.0,
         )
-        if expiry_candle is None:
+        if exit_tick is None:
             logger.warning(
-                f"Result for {asset}: no completed expiry candle found "
-                f"(entry_tick={entry_tick_timestamp})"
+                f"Result for {asset}: no stream tick at expiry "
+                f"(expiry={expiry_timestamp}, entry_tick={entry_tick_timestamp})"
             )
             await application.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"⚠️ Chưa có nến đóng đúng thời điểm hết hạn cho {asset}. "
+                    f"⚠️ Không có tick stream đúng thời điểm hết hạn cho {asset}. "
                     "Bot không chấm WIN/LOSS để tránh kết luận sai."
                 ),
             )
             return
-        exit_price = float(expiry_candle.close)
-        expiry_stamp = (
-            expiry_candle.timestamp.timestamp()
-            if hasattr(expiry_candle.timestamp, "timestamp")
-            else float(expiry_candle.timestamp)
-        )
+        exit_price, expiry_stamp = exit_tick
         logger.info(
-            f"Result for {asset}: using completed candle close {exit_price} "
-            f"(candle_timestamp={expiry_stamp}, entry_tick={entry_tick_timestamp})"
+            f"Result for {asset}: using expiry stream tick {exit_price} "
+            f"(tick_timestamp={expiry_stamp}, expiry={expiry_timestamp}, "
+            f"entry_tick={entry_tick_timestamp})"
         )
 
         logger.info(

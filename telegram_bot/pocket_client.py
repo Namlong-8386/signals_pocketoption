@@ -386,6 +386,28 @@ class BotPocketClient:
             await asyncio.sleep(0.1)
         return None
 
+    async def get_stream_price_at_or_after(
+        self,
+        asset: str,
+        target_timestamp: float,
+        timeout: float = 10.0,
+    ) -> Optional[tuple[float, float]]:
+        """Return the first broker tick at or after an expiry timestamp.
+
+        For short PocketOption expiries, the stream quote is the relevant
+        settlement reference. A candle close can lag or belong to a different
+        server boundary, so it must not replace the broker-timestamped tick.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            tick = self._latest_prices.get(asset)
+            if tick and tick[1] >= target_timestamp:
+                return tick
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(0.1, remaining))
+
     async def get_assets(self, max_wait: float = 10.0) -> Dict[str, Dict[str, Any]]:
         await self.ensure_connected()
         if self._assets_last_update:
