@@ -89,7 +89,6 @@ from telegram_bot.config import (
     POCKETOPTION_PLATFORM,
     ANALYSIS_CANDLE_COUNT,
     ASSET_CACHE_TTL,
-    RESULT_CANDLE_COUNT,
 )
 
 
@@ -386,28 +385,6 @@ class BotPocketClient:
             await asyncio.sleep(0.1)
         return None
 
-    async def get_stream_price_at_or_after(
-        self,
-        asset: str,
-        target_timestamp: float,
-        timeout: float = 10.0,
-    ) -> Optional[tuple[float, float]]:
-        """Return the first broker tick at or after an expiry timestamp.
-
-        For short PocketOption expiries, the stream quote is the relevant
-        settlement reference. A candle close can lag or belong to a different
-        server boundary, so it must not replace the broker-timestamped tick.
-        """
-        deadline = asyncio.get_running_loop().time() + timeout
-        while True:
-            tick = self._latest_prices.get(asset)
-            if tick and tick[1] >= target_timestamp:
-                return tick
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return None
-            await asyncio.sleep(min(0.1, remaining))
-
     async def get_assets(self, max_wait: float = 10.0) -> Dict[str, Dict[str, Any]]:
         await self.ensure_connected()
         if self._assets_last_update:
@@ -517,80 +494,12 @@ class BotPocketClient:
                 f"PocketOption không trả dữ liệu nến cho {asset}. Vui lòng thử lại."
             )
 
-    @staticmethod
-    def _candle_timestamp(candle: Candle) -> float:
-        value = candle.timestamp
-        return value.timestamp() if hasattr(value, "timestamp") else float(value)
-
-    async def get_completed_candles(
-        self, asset: str, timeframe: int, count: int = ANALYSIS_CANDLE_COUNT
-    ) -> List[Candle]:
-        """Fetch history without the currently forming candle.
-
-        The last broker candle is often still open when a signal is requested.
-        Including it makes the analysis depend on a partial candle, while the
-        result is later judged at a completed expiry.  Keep both sides aligned.
-        """
-        candles = sorted(
-            await self.get_candles(asset, timeframe, count=count + 1),
-            key=self._candle_timestamp,
-        )
-        if len(candles) <= 1:
-            return []
-        # PocketOption returns the currently forming candle as the newest
-        # element. Do not compare its timestamp to the local clock: broker
-        # timestamps may be offset from the Replit host clock.
-        return candles[:-1][-count:]
-
     async def get_latest_price(self, asset: str, timeframe: int = 60) -> float:
         """Return the latest close price by fetching a few recent candles."""
         candles = await self.get_candles(asset, timeframe, count=5)
         if not candles:
             raise RuntimeError(f"Không lấy được giá cho {asset}")
         return float(candles[-1].close)
-
-    async def get_expiry_candle(
-        self,
-        asset: str,
-        timeframe: int,
-        entry_timestamp: float,
-        tolerance: float = 3.0,
-        wait_timeout: float = 8.0,
-    ) -> Optional[Candle]:
-        """Return the candle closing at the signal expiry.
-
-        Result classification must use a completed candle, not an arbitrary
-        tick observed after ``sleep(timeframe)``.  Candle timestamps from the
-        broker identify the candle open, so choose the first candle whose open
-        is at or after the expiry boundary and require it to be closed.
-        """
-        expiry = float(entry_timestamp) + float(timeframe)
-        deadline = asyncio.get_running_loop().time() + wait_timeout
-        while True:
-            candles = await self.get_candles(
-                asset, timeframe, count=max(5, RESULT_CANDLE_COUNT)
-            )
-            normalized = []
-            for candle in candles:
-                stamp = self._candle_timestamp(candle)
-                normalized.append((stamp, candle))
-            normalized.sort(key=lambda item: item[0])
-
-            # Never use a candle that ended before expiry. The previous logic
-            # did exactly that when the broker had not published the next
-            # candle yet, producing systematically false WIN/LOSS results.
-            candidates = [
-                (abs((stamp + timeframe) - expiry), candle)
-                for stamp, candle in normalized
-                if stamp + timeframe >= expiry - tolerance
-            ]
-            if candidates:
-                return min(candidates, key=lambda item: item[0])[1]
-
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return None
-            await asyncio.sleep(min(0.75, remaining))
 
     async def close(self) -> None:
         if self._client:

@@ -328,16 +328,7 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "Vui lòng quay lại và chọn cặp đang hoạt động.",
             )
             return await _show_asset_list(update, context)
-        # Analyze only completed candles. The live/forming candle cannot be
-        # compared fairly with the completed candle used at expiry.
-        candles = await pocket_client.get_completed_candles(
-            asset, timeframe_seconds
-        )
-        if len(candles) < 40:
-            raise RuntimeError(
-                f"Chỉ nhận được {len(candles)} nến đã đóng cho {asset}; "
-                "không đủ dữ liệu để dự đoán ngắn hạn."
-            )
+        candles = await pocket_client.get_candles(asset, timeframe_seconds)
         signal = analyze_candles(candles)
 
         # Use the live tick price as the entry price so consecutive signals
@@ -352,21 +343,6 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         signal.price = current_price
         logger.info(f"Using live price for {asset}: {current_price}")
-
-        if signal.direction != "WAIT":
-            # A 54% score is not enough to justify a short-expiry trade. Require
-            # both a stronger margin and at least one confirming walk-forward
-            # result when enough historical samples are available.
-            validation = signal.indicators.get("walk_forward", {})
-            if signal.confidence < 0.58 or (
-                validation.get("samples", 0) >= 20
-                and validation.get("accuracy", 0.5) < 0.50
-            ):
-                signal.direction = "WAIT"
-                signal.confidence = min(signal.confidence, 0.57)
-                signal.reasons.append(
-                    "WAIT: lợi thế chưa đủ mạnh hoặc kiểm định gần đây đang bất lợi"
-                )
 
         entry_time = datetime.now()
         user_id = update.effective_user.id
@@ -472,45 +448,31 @@ async def _update_result_after_delay(application: Application, signal_data: Dict
     try:
         await pocket_client.ensure_connected()
 
+        # Prefer the live tick price for the exit; fall back to fetching the
+        # latest candle close if the stream hasn't provided a price yet.
         entry_tick = signal_data.get("entry_tick")
         entry_tick_timestamp = entry_tick[1] if entry_tick else None
-        if entry_tick_timestamp is None:
+        exit_price = await pocket_client.get_current_price_with_timeout(
+            asset,
+            timeout=3.0,
+            min_timestamp=entry_tick_timestamp,
+        )
+        if exit_price is None:
             logger.warning(
-                f"Result for {asset}: missing broker entry timestamp; "
+                f"Result for {asset}: no fresh tick after entry; "
                 "will not classify the signal"
             )
             await application.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"⚠️ Thiếu mốc thời gian vào lệnh cho {asset} sau {tf_key}. "
+                    f"⚠️ Không đủ dữ liệu giá mới cho {asset} sau {tf_key}. "
                     "Bot không thể xác định WIN/LOSS chính xác."
                 ),
             )
             return
-        expiry_timestamp = entry_tick_timestamp + signal_data["timeframe_seconds"]
-        exit_tick = await pocket_client.get_stream_price_at_or_after(
-            asset,
-            expiry_timestamp,
-            timeout=10.0,
-        )
-        if exit_tick is None:
-            logger.warning(
-                f"Result for {asset}: no stream tick at expiry "
-                f"(expiry={expiry_timestamp}, entry_tick={entry_tick_timestamp})"
-            )
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"⚠️ Không có tick stream đúng thời điểm hết hạn cho {asset}. "
-                    "Bot không chấm WIN/LOSS để tránh kết luận sai."
-                ),
-            )
-            return
-        exit_price, expiry_stamp = exit_tick
         logger.info(
-            f"Result for {asset}: using expiry stream tick {exit_price} "
-            f"(tick_timestamp={expiry_stamp}, expiry={expiry_timestamp}, "
-            f"entry_tick={entry_tick_timestamp})"
+            f"Result for {asset}: using fresh live price {exit_price} "
+            f"(entry_tick={entry_tick_timestamp})"
         )
 
         logger.info(
