@@ -137,10 +137,12 @@ async def _show_asset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             title = f"{get_category_label(category)} *Cặp tiền*"
 
         if not symbols:
-            await query.edit_message_text(
+            await _show_photo_message(
+                query,
+                ASSET_IMAGE,
                 "Không tìm thấy cặp tiền nào đang hoạt động trong nhóm này. "
                 "Thử lại sau hoặc chọn nhóm khác.",
-                reply_markup=InlineKeyboardMarkup([
+                InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔙 Quay lại", callback_data="back_market")]
                 ]),
             )
@@ -184,9 +186,11 @@ async def _show_asset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     except Exception as e:
         logger.error(f"_show_asset_list error: {e}")
-        await query.edit_message_text(
+        await _show_photo_message(
+            query,
+            ASSET_IMAGE,
             f"❌ Lỗi: {e}\n\nThử /start lại.",
-            reply_markup=InlineKeyboardMarkup([
+            InlineKeyboardMarkup([
                 [InlineKeyboardButton("🏠 Menu chính", callback_data="back_market")]
             ]),
         )
