@@ -1,16 +1,16 @@
-"""Bot configuration loaded from environment variables."""
-import os
+"""Configuration used by the running Telegram bot.
 
+The active bot imports this module, so keep the shared credentials and broker
+settings in the repository's top-level ``config.py`` as requested.
+"""
 
-# Credentials must be provided through Replit Secrets, never committed to source.
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-POCKETOPTION_SSID = os.getenv(
-    "POCKETOPTION_SSID",
-    '''[ "auth", { "session": "a:4:{s:10:\"session_id\";s:32:\"459c46f6ca7a7bbe21999bf1ebd90567\";s:10:\"ip_address\";s:14:\"194.233.82.226\";s:10:\"user_agent\";s:111:\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36\";s:13:\"last_activity\";i:1784980480;}3570955395f21b7eb7425e4876ae52d5", "isDemo": 0, "uid": 93969941, "platform": 2, "isFastHistory": true, "isOptimized": true } ]''',
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    POCKETOPTION_SSID,
+    POCKETOPTION_DEMO,
+    POCKETOPTION_UID,
+    POCKETOPTION_PLATFORM,
 )
-POCKETOPTION_DEMO = os.getenv("POCKETOPTION_DEMO", "0").lower() in ("1", "true", "yes")
-POCKETOPTION_UID = int(os.getenv("POCKETOPTION_UID", "93969941") or "93969941")
-POCKETOPTION_PLATFORM = int(os.getenv("POCKETOPTION_PLATFORM", "2") or "2")
 
 # Available timeframes for the bot (in seconds)
 TIMEFRAMES = {
