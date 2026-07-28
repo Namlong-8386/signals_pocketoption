@@ -2,6 +2,7 @@
 import asyncio
 import json
 import re
+import time
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -495,6 +496,29 @@ class BotPocketClient:
                 f"PocketOption không trả dữ liệu nến cho {asset}. Vui lòng thử lại."
             )
 
+    @staticmethod
+    def _candle_timestamp(candle: Candle) -> float:
+        value = candle.timestamp
+        return value.timestamp() if hasattr(value, "timestamp") else float(value)
+
+    async def get_completed_candles(
+        self, asset: str, timeframe: int, count: int = ANALYSIS_CANDLE_COUNT
+    ) -> List[Candle]:
+        """Fetch history without the currently forming candle.
+
+        The last broker candle is often still open when a signal is requested.
+        Including it makes the analysis depend on a partial candle, while the
+        result is later judged at a completed expiry.  Keep both sides aligned.
+        """
+        candles = await self.get_candles(asset, timeframe, count=count + 1)
+        now = time.time()
+        completed = [
+            candle
+            for candle in candles
+            if self._candle_timestamp(candle) + timeframe <= now + 1.0
+        ]
+        return sorted(completed, key=self._candle_timestamp)[-count:]
+
     async def get_latest_price(self, asset: str, timeframe: int = 60) -> float:
         """Return the latest close price by fetching a few recent candles."""
         candles = await self.get_candles(asset, timeframe, count=5)
@@ -516,9 +540,7 @@ class BotPocketClient:
         broker identify the candle open, so choose the first candle whose open
         is at or after the expiry boundary and require it to be closed.
         """
-        candles = await self.get_candles(
-            asset, timeframe, count=max(5, RESULT_CANDLE_COUNT)
-        )
+        candles = await self.get_candles(asset, timeframe, count=max(5, RESULT_CANDLE_COUNT))
         if not candles:
             return None
 
@@ -534,7 +556,7 @@ class BotPocketClient:
         candidates = [
             (abs((stamp + timeframe) - expiry), candle)
             for stamp, candle in normalized
-            if stamp + timeframe <= expiry + tolerance
+            if expiry - tolerance <= stamp + timeframe <= expiry + tolerance
         ]
         if not candidates:
             return None

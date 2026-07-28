@@ -328,7 +328,16 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "Vui lòng quay lại và chọn cặp đang hoạt động.",
             )
             return await _show_asset_list(update, context)
-        candles = await pocket_client.get_candles(asset, timeframe_seconds)
+        # Analyze only completed candles. The live/forming candle cannot be
+        # compared fairly with the completed candle used at expiry.
+        candles = await pocket_client.get_completed_candles(
+            asset, timeframe_seconds
+        )
+        if len(candles) < 40:
+            raise RuntimeError(
+                f"Chỉ nhận được {len(candles)} nến đã đóng cho {asset}; "
+                "không đủ dữ liệu để dự đoán ngắn hạn."
+            )
         signal = analyze_candles(candles)
 
         # Use the live tick price as the entry price so consecutive signals
