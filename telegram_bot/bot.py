@@ -128,9 +128,6 @@ async def _show_asset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return await start(update, context)
 
     try:
-        await pocket_client.ensure_connected()
-        await pocket_client.get_assets()
-
         if category in ("real", "otc"):
             # Backward-compatible legacy market filter
             symbols = pocket_client.list_otc_assets() if category == "otc" else pocket_client.list_real_assets()
@@ -236,8 +233,6 @@ async def asset_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Telegram can deliver callbacks from an older menu message after the
     # broker status has changed. Reject stale buttons immediately instead of
     # allowing a closed pair to reach the timeframe screen.
-    await pocket_client.ensure_connected()
-    await pocket_client.get_assets(max_wait=2.0)
     if not pocket_client.is_asset_tradable(asset):
         await query.answer("Cặp này hiện đã đóng hoặc tạm dừng.", show_alert=True)
         return await _show_asset_list(update, context)
@@ -276,7 +271,6 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try:
         await pocket_client.ensure_connected()
-        await pocket_client.get_assets(max_wait=2.0)
         if not pocket_client.is_asset_tradable(asset):
             await _show_caption_message(
                 query,

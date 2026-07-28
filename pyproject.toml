@@ -7,5 +7,6 @@ dependencies = [
     "loguru>=0.7.3",
     "pocketoptionapi-async>=2.0.1",
     "python-telegram-bot>=22.8",
+    "telegram>=0.0.1",
     "websockets==13.0",
 ]
