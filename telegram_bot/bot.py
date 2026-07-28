@@ -377,6 +377,12 @@ async def timeframe_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 else "⏸ Chưa đủ điều kiện xác nhận — bot không khuyến nghị vào lệnh."
             )
         )
+        validation = signal.indicators.get("walk_forward", {})
+        if validation.get("samples", 0) >= 12:
+            text += (
+                f"\n🧪 Kiểm định lịch sử: *{validation['accuracy'] * 100:.0f}%* "
+                f"({validation['samples']} mẫu)"
+            )
 
         keyboard = [
             [InlineKeyboardButton("🔔 Nhận tín hiệu mới", callback_data="new_signal")],

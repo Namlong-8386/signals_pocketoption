@@ -161,8 +161,54 @@ def _adx(highs: List[float], lows: List[float], closes: List[float], period: int
     return {"adx": adx, "plus_di": plus, "minus_di": minus}
 
 
-def analyze_candles(candles: List[Candle]) -> SignalResult:
-    """Analyze a list of candles and return a CALL/PUT signal."""
+def _walk_forward_validation(
+    candles: List[Candle], min_history: int = 40
+) -> Dict[str, Any]:
+    """Measure the strategy on prior candles without looking into the future.
+
+    For every historical point, only candles before that point are passed to the
+    analyzer.  The next candle is then used as the outcome.  This is deliberately
+    a small walk-forward test, not a claim that past results predict the market.
+    """
+    if len(candles) < min_history + 8:
+        return {"samples": 0, "accuracy": 0.5, "call_accuracy": 0.5,
+                "put_accuracy": 0.5, "edge": 0.0}
+
+    wins = calls = puts = call_wins = put_wins = 0
+    # Leave a little history for indicators while keeping the live request fast.
+    first = min_history
+    for point in range(first, len(candles) - 1):
+        historical = analyze_candles(candles[:point], run_validation=False)
+        if historical.direction == "WAIT":
+            continue
+        actual_up = candles[point].close > candles[point - 1].close
+        predicted_up = historical.direction == "CALL"
+        won = predicted_up == actual_up
+        wins += int(won)
+        if predicted_up:
+            calls += 1
+            call_wins += int(won)
+        else:
+            puts += 1
+            put_wins += int(won)
+
+    samples = calls + puts
+    accuracy = wins / samples if samples else 0.5
+    call_accuracy = call_wins / calls if calls else 0.5
+    put_accuracy = put_wins / puts if puts else 0.5
+    return {
+        "samples": samples,
+        "accuracy": round(accuracy, 3),
+        "call_accuracy": round(call_accuracy, 3),
+        "put_accuracy": round(put_accuracy, 3),
+        "edge": round(accuracy - 0.5, 3),
+    }
+
+
+def analyze_candles(
+    candles: List[Candle], run_validation: bool = True
+) -> SignalResult:
+    """Analyze a full candle history and optionally calibrate it walk-forward."""
     if not candles:
         raise ValueError("No candles provided for analysis")
 
@@ -175,10 +221,10 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
     # Need enough data
     if len(closes) < 30:
         return SignalResult(
-            direction="CALL",
+            direction="WAIT",
             confidence=0.5,
             price=current_price,
-            reasons=["Không đủ nến để phân tích sâu"],
+            reasons=["WAIT: chưa đủ lịch sử để kiểm định chiến lược"],
             indicators={"price": current_price, "candles": len(closes)},
         )
 
@@ -308,11 +354,43 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
     direction = "CALL" if call_score > put_score else "PUT"
     winning_score = max(call_score, put_score)
     confidence = min(0.95, max(0.5, winning_score / total if total else 0.5))
-    # A weak edge or a tie is WAIT rather than a forced trade direction.
-    if call_score == put_score or confidence < 0.58:
+
+    validation = (
+        _walk_forward_validation(sorted_candles)
+        if run_validation
+        else {"samples": 0, "accuracy": 0.5, "call_accuracy": 0.5,
+              "put_accuracy": 0.5, "edge": 0.0}
+    )
+    # Use the pair's recent historical behavior as calibration, not as a
+    # replacement for the indicators.  Only a meaningful sample can change the
+    # direction, which prevents one lucky candle from overfitting the signal.
+    if validation["samples"] >= 12:
+        historical_accuracy = validation[
+            "call_accuracy" if direction == "CALL" else "put_accuracy"
+        ]
+        opposite_accuracy = validation[
+            "put_accuracy" if direction == "CALL" else "call_accuracy"
+        ]
+        confidence = (confidence * 0.65) + (historical_accuracy * 0.35)
+        if (
+            confidence < 0.54
+            and opposite_accuracy >= 0.56
+            and opposite_accuracy - historical_accuracy >= 0.08
+        ):
+            direction = "PUT" if direction == "CALL" else "CALL"
+            confidence = opposite_accuracy
+            reasons.append("Walk-forward ưu tiên hướng có kết quả lịch sử tốt hơn")
+        reasons.append(
+            f"Backtest lăn {validation['samples']} mẫu: "
+            f"{validation['accuracy'] * 100:.0f}%"
+        )
+
+    # Do not force a trade when there is no directional edge.  The lower
+    # threshold reduces unnecessary WAIT responses while retaining a tie guard.
+    if call_score == put_score or confidence < 0.54:
         direction = "WAIT"
         confidence = round(confidence, 2)
-        reasons.append("WAIT: độ tin cậy dưới 58% hoặc hai phe hòa điểm")
+        reasons.append("WAIT: tín hiệu chưa có lợi thế đủ rõ")
 
     return SignalResult(
         direction=direction,
@@ -339,6 +417,7 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
             "trend_up": trend_up,
             "trend_down": trend_down,
             "candles": len(closes),
+            "walk_forward": validation,
         },
     )
 
