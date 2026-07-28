@@ -26,9 +26,15 @@ _COMMODITY_SYMBOLS = {
     "XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD", "XNGUSD", "UKBRENT", "USCRUDE",
 }
 _FOREX_CURRENCIES = {
-    "AED", "AUD", "CAD", "CHF", "EUR", "GBP", "HKD", "IDR", "INR",
-    "JPY", "KRW", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "RUB",
+    "AED", "AUD", "BRL", "CAD", "CHF", "CNY", "CZK", "DKK", "EUR",
+    "GBP", "HKD", "HUF", "IDR", "ILS", "INR", "JPY", "KRW", "MXN",
+    "MYR", "NOK", "NZD", "PHP", "PLN", "RON", "RUB", "SAR", "SEK",
     "SGD", "THB", "TRY", "TWD", "USD", "VND", "ZAR",
+}
+
+_STOCK_NAME_MARKERS = {
+    "APPLE", "AMAZON", "AMERICANEXPRESS", "BOEING", "FACEBOOK",
+    "MICROSOFT", "NETFLIX", "TESLA", "TWITTER",
 }
 
 _CATEGORY_LABELS = {
@@ -45,6 +51,9 @@ def get_asset_category(symbol: str) -> str:
     """Categorize an asset symbol into a market group."""
     raw = symbol.upper().strip()
     s = raw.replace("_", "")
+    is_otc = raw.endswith("_OTC")
+    base = raw[:-4] if is_otc else raw
+    base_compact = base.replace("_", "")
     # OTC should only contain genuine Forex pairs, e.g. USDJPY_otc.
     # Do not classify OTC indices, crypto, stocks, or commodities as OTC.
     otc_match = re.fullmatch(r"([A-Z]{3})([A-Z]{3})_OTC", raw)
@@ -53,6 +62,13 @@ def get_asset_category(symbol: str) -> str:
         if base in _FOREX_CURRENCIES and quote in _FOREX_CURRENCIES:
             return "otc"
     if raw.startswith("#"):
+        return "stock"
+    # Some server records use names instead of ticker symbols
+    # (Facebook_OTC, Tesla_otc, Microsoft_otc). They are not currency pairs.
+    if is_otc and (
+        base_compact in _STOCK_NAME_MARKERS
+        or not re.fullmatch(r"[A-Z]{6}", base_compact)
+    ):
         return "stock"
     if s in _COMMODITY_SYMBOLS or s.startswith(("XAU", "XAG", "XPT", "XPD", "XNG")):
         return "commodity"
@@ -341,7 +357,10 @@ class BotPocketClient:
 
     def list_real_assets(self) -> List[str]:
         return sorted(
-            [sym for sym, info in self._assets.items() if not info.get("is_otc") and info.get("tradable")]
+            [
+                sym for sym, info in self._assets.items()
+                if get_asset_category(sym) == "forex" and info.get("tradable")
+            ]
         )
 
     def list_all_active_assets(self) -> List[str]:
