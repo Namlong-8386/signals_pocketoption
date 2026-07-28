@@ -67,6 +67,57 @@ def _bollinger(closes: List[float], period: int = 20, std_dev: int = 2) -> Dict[
     return {"upper": middle + band, "middle": middle, "lower": middle - band}
 
 
+def _mean(values: List[float], period: int) -> float:
+    return sum(values[-period:]) / min(period, len(values)) if values else 0.0
+
+
+def _atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    if len(closes) < 2:
+        return 0.0
+    ranges = [
+        max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+        for i in range(1, len(closes))
+    ]
+    return _mean(ranges, period)
+
+
+def _stochastic(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Dict[str, float]:
+    if len(closes) < period:
+        return {"k": 50.0, "d": 50.0}
+    values = []
+    for end in range(period, len(closes) + 1):
+        high = max(highs[end - period:end])
+        low = min(lows[end - period:end])
+        values.append(50.0 if high == low else 100.0 * (closes[end - 1] - low) / (high - low))
+    return {"k": values[-1], "d": _mean(values, 3)}
+
+
+def _cci(highs: List[float], lows: List[float], closes: List[float], period: int = 20) -> float:
+    if len(closes) < period:
+        return 0.0
+    typical = [(h + l + c) / 3.0 for h, l, c in zip(highs, lows, closes)]
+    window = typical[-period:]
+    mean = sum(window) / period
+    deviation = sum(abs(value - mean) for value in window) / period
+    return 0.0 if deviation == 0 else (window[-1] - mean) / (0.015 * deviation)
+
+
+def _adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Dict[str, float]:
+    if len(closes) < period + 2:
+        return {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
+    trs, plus_dm, minus_dm = [], [], []
+    for i in range(1, len(closes)):
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+        up, down = highs[i] - highs[i - 1], lows[i - 1] - lows[i]
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+    tr = _mean(trs, period)
+    plus = 100.0 * _mean(plus_dm, period) / tr if tr else 0.0
+    minus = 100.0 * _mean(minus_dm, period) / tr if tr else 0.0
+    adx = 100.0 * abs(plus - minus) / (plus + minus) if plus + minus else 0.0
+    return {"adx": adx, "plus_di": plus, "minus_di": minus}
+
+
 def analyze_candles(candles: List[Candle]) -> SignalResult:
     """Analyze a list of candles and return a CALL/PUT signal."""
     if not candles:
@@ -93,79 +144,113 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
     rsi_val = _rsi(closes, 14)
     macd_val = _macd(closes)
     bb = _bollinger(closes)
-
+    stochastic = _stochastic(highs, lows, closes)
+    cci_val = _cci(highs, lows, closes)
+    atr_val = _atr(highs, lows, closes)
+    adx = _adx(highs, lows, closes)
     ema9_current = ema9[-1] if ema9 else current_price
     ema21_current = ema21[-1] if ema21 else current_price
-
-    # Trend strength by recent candles
     last_5 = closes[-5:]
-    trend_up = sum(1 for i in range(1, len(last_5)) if last_5[i] > last_5[i - 1])
-    trend_down = sum(1 for i in range(1, len(last_5)) if last_5[i] < last_5[i - 1])
-
-    call_score = 0.0
-    put_score = 0.0
+    trend_up = sum(last_5[i] > last_5[i - 1] for i in range(1, len(last_5)))
+    trend_down = sum(last_5[i] < last_5[i - 1] for i in range(1, len(last_5)))
+    call_score = put_score = 0.0
     reasons: List[str] = []
 
-    # EMA crossover / trend
+    # Trend strategy: EMA9/21, MACD and ADX must agree.
     if ema9_current > ema21_current:
+        call_score += 2.0
+        reasons.append("Trend tăng: EMA9 trên EMA21")
+    else:
+        put_score += 2.0
+        reasons.append("Trend giảm: EMA9 dưới EMA21")
+    if macd_val["histogram"] > 0:
+        call_score += 1.5
+        reasons.append("MACD xác nhận đà tăng")
+    else:
+        put_score += 1.5
+        reasons.append("MACD xác nhận đà giảm")
+    if adx["adx"] >= 20:
+        if adx["plus_di"] > adx["minus_di"]:
+            call_score += 1.2
+            reasons.append(f"ADX {adx['adx']:.1f}: lực mua chiếm ưu thế")
+        else:
+            put_score += 1.2
+            reasons.append(f"ADX {adx['adx']:.1f}: lực bán chiếm ưu thế")
+
+    # Channel strategy: reward only entries near Bollinger edges.
+    width = max(bb["upper"] - bb["lower"], 1e-12)
+    position = (current_price - bb["lower"]) / width
+    if position <= 0.15:
+        call_score += 1.8
+        reasons.append("Bollinger: giá sát dải dưới")
+    elif position >= 0.85:
+        put_score += 1.8
+        reasons.append("Bollinger: giá sát dải trên")
+    if rsi_val <= 30:
+        call_score += 1.5
+        reasons.append(f"RSI {rsi_val:.1f}: quá bán")
+    elif rsi_val >= 70:
+        put_score += 1.5
+        reasons.append(f"RSI {rsi_val:.1f}: quá mua")
+
+    # Oscillator strategy: Stochastic and CCI.
+    if stochastic["k"] <= 20 and stochastic["k"] >= stochastic["d"]:
+        call_score += 1.4
+        reasons.append(f"Stochastic {stochastic['k']:.1f}: bật lên")
+    elif stochastic["k"] >= 80 and stochastic["k"] <= stochastic["d"]:
+        put_score += 1.4
+        reasons.append(f"Stochastic {stochastic['k']:.1f}: quay đầu")
+    if cci_val <= -100:
         call_score += 1.0
-        reasons.append(f"EMA9 ({ema9_current:.5f}) > EMA21 ({ema21_current:.5f})")
-    else:
+        reasons.append(f"CCI {cci_val:.0f}: quá bán")
+    elif cci_val >= 100:
         put_score += 1.0
-        reasons.append(f"EMA9 ({ema9_current:.5f}) < EMA21 ({ema21_current:.5f})")
+        reasons.append(f"CCI {cci_val:.0f}: quá mua")
 
-    # RSI
-    if rsi_val < 70:
-        call_score += 0.7
-    else:
-        put_score += 0.5
-        reasons.append(f"RSI={rsi_val:.1f} vùng quá mua")
+    # Candle confirmation: engulfing, rejection wick, then strong body.
+    candle, previous = sorted_candles[-1], sorted_candles[-2]
+    body = candle.close - candle.open
+    previous_body = previous.close - previous.open
+    candle_range = max(candle.high - candle.low, 1e-12)
+    body_ratio = abs(body) / candle_range
+    upper_wick = candle.high - max(candle.open, candle.close)
+    lower_wick = min(candle.open, candle.close) - candle.low
+    bullish_engulf = body > 0 and previous_body < 0 and candle.close >= previous.open and candle.open <= previous.close
+    bearish_engulf = body < 0 and previous_body > 0 and candle.close <= previous.open and candle.open >= previous.close
+    if bullish_engulf or (body > 0 and lower_wick >= abs(body) * 1.5):
+        call_score += 1.0
+        reasons.append("Nến xác nhận CALL")
+    elif bearish_engulf or (body < 0 and upper_wick >= abs(body) * 1.5):
+        put_score += 1.0
+        reasons.append("Nến xác nhận PUT")
+    elif body_ratio >= 0.55:
+        if body > 0:
+            call_score += 0.45
+            reasons.append("Nến động lượng tăng")
+        else:
+            put_score += 0.45
+            reasons.append("Nến động lượng giảm")
 
-    if rsi_val > 30:
-        put_score += 0.7
-    else:
-        call_score += 0.5
-        reasons.append(f"RSI={rsi_val:.1f} vùng quá bán")
-
-    # MACD
-    histogram = macd_val.get("histogram", 0.0)
-    if histogram > 0:
-        call_score += 0.8
-        reasons.append(f"MACD histogram dương ({histogram:.6f})")
-    else:
-        put_score += 0.8
-        reasons.append(f"MACD histogram âm ({histogram:.6f})")
-
-    # Bollinger position
-    if current_price < bb["lower"]:
-        call_score += 0.8
-        reasons.append("Giá chạm dải Bollinger dưới - có khả năng hồi")
-    elif current_price > bb["upper"]:
-        put_score += 0.8
-        reasons.append("Giá chạm dải Bollinger trên - có khả năng điều chỉnh")
-    else:
-        call_score += 0.3
-        put_score += 0.3
-
-    # Recent short trend
+    # Market structure: support/resistance and short-term momentum.
+    support, resistance = min(lows[-20:]), max(highs[-20:])
+    span = max(resistance - support, 1e-12)
+    if current_price <= support + span * 0.12:
+        call_score += 1.0
+        reasons.append("Giá gần hỗ trợ 20 nến")
+    elif current_price >= resistance - span * 0.12:
+        put_score += 1.0
+        reasons.append("Giá gần kháng cự 20 nến")
     if trend_up >= 3:
         call_score += 0.6
-        reasons.append(f"Xu hướng 5 nến gần nhất tăng ({trend_up}/4)")
-    if trend_down >= 3:
+    elif trend_down >= 3:
         put_score += 0.6
-        reasons.append(f"Xu hướng 5 nến gần nhất giảm ({trend_down}/4)")
 
     total = call_score + put_score
-    if total == 0:
-        direction = "CALL"
-        confidence = 0.5
-    else:
-        if call_score > put_score:
-            direction = "CALL"
-            confidence = round(call_score / total, 2)
-        else:
-            direction = "PUT"
-            confidence = round(put_score / total, 2)
+    direction = "CALL" if call_score >= put_score else "PUT"
+    winning_score = max(call_score, put_score)
+    confidence = min(0.95, max(0.5, winning_score / total if total else 0.5))
+    if abs(call_score - put_score) < 1.0:
+        reasons.append("Tín hiệu giằng co — nên thận trọng")
 
     return SignalResult(
         direction=direction,
@@ -179,6 +264,14 @@ def analyze_candles(candles: List[Candle]) -> SignalResult:
             "rsi": rsi_val,
             "macd": macd_val,
             "bollinger": bb,
+            "stochastic": stochastic,
+            "cci": cci_val,
+            "adx": adx,
+            "atr": atr_val,
+            "support": support,
+            "resistance": resistance,
+            "call_score": round(call_score, 2),
+            "put_score": round(put_score, 2),
             "trend_up": trend_up,
             "trend_down": trend_down,
             "candles": len(closes),
