@@ -1,6 +1,7 @@
 """PocketOption client wrapper used by the Telegram bot."""
 import asyncio
 import json
+import re
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -24,6 +25,11 @@ _INDEX_SYMBOLS = {
 _COMMODITY_SYMBOLS = {
     "XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD", "XNGUSD", "UKBRENT", "USCRUDE",
 }
+_FOREX_CURRENCIES = {
+    "AED", "AUD", "CAD", "CHF", "EUR", "GBP", "HKD", "IDR", "INR",
+    "JPY", "KRW", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "RUB",
+    "SGD", "THB", "TRY", "TWD", "USD", "VND", "ZAR",
+}
 
 _CATEGORY_LABELS = {
     "forex": "💱 Forex",
@@ -37,10 +43,16 @@ _CATEGORY_LABELS = {
 
 def get_asset_category(symbol: str) -> str:
     """Categorize an asset symbol into a market group."""
-    s = symbol.upper().replace("_", "")
-    if "OTC" in s:
-        return "otc"
-    if symbol.startswith("#"):
+    raw = symbol.upper().strip()
+    s = raw.replace("_", "")
+    # OTC should only contain genuine Forex pairs, e.g. USDJPY_otc.
+    # Do not classify OTC indices, crypto, stocks, or commodities as OTC.
+    otc_match = re.fullmatch(r"([A-Z]{3})([A-Z]{3})_OTC", raw)
+    if otc_match:
+        base, quote = otc_match.groups()
+        if base in _FOREX_CURRENCIES and quote in _FOREX_CURRENCIES:
+            return "otc"
+    if raw.startswith("#"):
         return "stock"
     if s in _COMMODITY_SYMBOLS or s.startswith(("XAU", "XAG", "XPT", "XPD", "XNG")):
         return "commodity"
@@ -195,7 +207,7 @@ class BotPocketClient:
                 if not symbol:
                     continue
                 payout = item[5] if len(item) > 5 else 0
-                is_otc = "_otc" in symbol
+                is_otc = get_asset_category(symbol) == "otc"
                 # field index 14 (if present) indicates if asset is open/tradable
                 tradable = bool(item[14]) if len(item) > 14 else (payout > 0)
                 self._assets[symbol] = {
@@ -211,7 +223,7 @@ class BotPocketClient:
                 symbol = item.get("symbol")
                 if symbol:
                     self._assets[symbol] = {
-                        "is_otc": "_otc" in symbol,
+                        "is_otc": get_asset_category(str(symbol)) == "otc",
                         "tradable": item.get("tradable", True),
                         **item,
                     }
@@ -224,7 +236,7 @@ class BotPocketClient:
         # New library emits one event per asset: {id, symbol, name, type, payout}
         symbol = data.get("symbol")
         if symbol:
-            is_otc = symbol.endswith("_otc")
+            is_otc = get_asset_category(symbol) == "otc"
             self._assets[symbol] = {
                 "id": data.get("id"),
                 "name": data.get("name"),
@@ -319,7 +331,10 @@ class BotPocketClient:
 
     def list_otc_assets(self) -> List[str]:
         return sorted(
-            [sym for sym, info in self._assets.items() if info.get("is_otc") and info.get("tradable")]
+            [
+                sym for sym, info in self._assets.items()
+                if get_asset_category(sym) == "otc" and info.get("tradable")
+            ]
         )
 
     def list_real_assets(self) -> List[str]:
