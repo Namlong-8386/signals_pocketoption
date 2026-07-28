@@ -233,6 +233,15 @@ async def asset_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return await _show_asset_list(update, context)
 
     asset = query.data.split("_", 1)[-1]
+    # Telegram can deliver callbacks from an older menu message after the
+    # broker status has changed. Reject stale buttons immediately instead of
+    # allowing a closed pair to reach the timeframe screen.
+    await pocket_client.ensure_connected()
+    await pocket_client.get_assets(max_wait=2.0)
+    if not pocket_client.is_asset_tradable(asset):
+        await query.answer("Cặp này hiện đã đóng hoặc tạm dừng.", show_alert=True)
+        return await _show_asset_list(update, context)
+
     context.user_data["asset"] = asset
 
     keyboard = [

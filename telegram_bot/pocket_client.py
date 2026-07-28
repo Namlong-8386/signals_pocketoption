@@ -191,17 +191,15 @@ class BotPocketClient:
                 raise RuntimeError("Không thể kết nối đến PocketOption. Kiểm tra lại SSID.")
 
             self._connected = True
-            # Wait briefly for asset list to arrive
+            # Wait briefly for the server's asset-status snapshot to arrive.
+            # Never seed tradable assets from the library's symbol list:
+            # symbols can still emit ticks while trading is closed.
             await asyncio.sleep(3.0)
-            # If no assets arrived from the server, seed from library's hardcoded list
             if not self._assets:
-                logger.warning("No asset list received from server — using built-in fallback list")
-                self._assets = {
-                    sym: {"is_otc": "_otc" in sym, "tradable": True, "id": asset_id}
-                    for sym, asset_id in LIBRARY_ASSETS.items()
-                }
-                self._assets_last_update = datetime.now().timestamp()
-                logger.info(f"Fallback asset list loaded: {len(self._assets)} assets")
+                logger.warning(
+                    "No asset-status snapshot received from server; "
+                    "no trading pairs will be shown until one arrives"
+                )
             logger.info("Connected to PocketOption.")
             return True
 
@@ -226,8 +224,9 @@ class BotPocketClient:
                     continue
                 payout = item[5] if len(item) > 5 else 0
                 is_otc = get_asset_category(symbol) == "otc"
-                # field index 14 (if present) indicates if asset is open/tradable
-                tradable = bool(item[14]) if len(item) > 14 else (payout > 0)
+                # Field index 14 indicates if asset is open/tradable.
+                # Missing status must not be inferred from payout or ticks.
+                tradable = item[14] is True if len(item) > 14 else False
                 updated_assets[symbol] = {
                     "id": item[0],
                     "name": str(item[2]) if len(item) > 2 else symbol,
