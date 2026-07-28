@@ -410,25 +410,32 @@ def analyze_candles(
         else {"samples": 0, "accuracy": 0.5, "call_accuracy": 0.5,
               "put_accuracy": 0.5, "edge": 0.0}
     )
-    # Use the pair's recent historical behavior as calibration, not as a
-    # replacement for the indicators.  Only a meaningful sample can change the
-    # direction, which prevents one lucky candle from overfitting the signal.
+    # Use walk-forward results to calibrate both direction and confidence.
+    # Previously this only changed the direction when the technical confidence
+    # was already low, so a technically strong but historically poor direction
+    # could still be emitted (for example PUT 80% with PUT accuracy 53% while
+    # CALL accuracy was 80%).  That makes the displayed confidence misleading.
     if validation["samples"] >= 12:
-        historical_accuracy = validation[
-            "call_accuracy" if direction == "CALL" else "put_accuracy"
-        ]
-        opposite_accuracy = validation[
-            "put_accuracy" if direction == "CALL" else "call_accuracy"
-        ]
-        confidence = (confidence * 0.65) + (historical_accuracy * 0.35)
-        if (
-            confidence < 0.54
-            and opposite_accuracy >= 0.56
-            and opposite_accuracy - historical_accuracy >= 0.08
-        ):
-            direction = "PUT" if direction == "CALL" else "CALL"
-            confidence = opposite_accuracy
-            reasons.append("Walk-forward ưu tiên hướng có kết quả lịch sử tốt hơn")
+        call_accuracy = validation["call_accuracy"]
+        put_accuracy = validation["put_accuracy"]
+        historical_accuracy = call_accuracy if direction == "CALL" else put_accuracy
+        opposite_accuracy = put_accuracy if direction == "CALL" else call_accuracy
+        if validation["samples"] >= 20:
+            # Prefer the better validated side when the difference is larger
+            # than a small noise margin. Never force a side whose own measured
+            # accuracy is below 50%.
+            if opposite_accuracy - historical_accuracy >= 0.04:
+                direction = "PUT" if direction == "CALL" else "CALL"
+                historical_accuracy = opposite_accuracy
+                reasons.append("Walk-forward đổi sang hướng có độ chính xác tốt hơn")
+            if historical_accuracy < 0.50:
+                direction = "WAIT"
+                confidence = 0.50
+                reasons.append("WAIT: hướng hiện tại có kiểm định dưới 50%")
+        if direction != "WAIT":
+            # Validation is the stronger signal for the displayed confidence;
+            # technical score is only a secondary confirmation.
+            confidence = (confidence * 0.35) + (historical_accuracy * 0.65)
         reasons.append(
             f"Backtest lăn {validation['samples']} mẫu: "
             f"{validation['accuracy'] * 100:.0f}%"
